@@ -1,0 +1,7 @@
+*.json
+!/config/client_config.json
+!/config/supernode_config.json
+
+chunks_*
+
+*.pyc

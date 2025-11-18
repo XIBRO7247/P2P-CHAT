@@ -31,7 +31,11 @@ class Supernode:
         self._running.set()
         threading.Thread(target=self._recv_loop, daemon=True).start()
         threading.Thread(target=self._worker_loop, daemon=True).start()
+
+        lan_ip = self._guess_lan_ip()
         print(f"[supernode] Listening on {self.host}:{self.port}")
+        print(f"[supernode] LAN address (for clients): {lan_ip}:{self.port}")
+
 
     def stop(self):
         self._running.clear()
@@ -188,7 +192,7 @@ class Supernode:
             print(f"[supernode] FRIEND_REQUEST from {src_user} to unknown user {target}")
             return
 
-        # Get sender's endpoint so we can pass it along
+        # Look up the sender's endpoint so we can pass it to the recipient
         sender_ep = self.users.get(src_user)
         if not sender_ep:
             print(f"[supernode] FRIEND_REQUEST: no endpoint for src_user {src_user}")
@@ -258,6 +262,23 @@ class Supernode:
             forward_payload,
         )
         self._send(env, (ip, port))
+
+    @staticmethod
+    def _guess_lan_ip() -> str:
+        """
+        Try to determine the LAN IP address of this machine.
+        Falls back to 127.0.0.1 if we can't reach an external host.
+        """
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # We never actually send anything to 8.8.8.8, just use it to pick the right interface
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
+        finally:
+            s.close()
+
 
 
 if __name__ == "__main__":

@@ -5,6 +5,8 @@ import threading
 from queue import Queue
 from typing import Any, Dict, Tuple
 
+import json
+
 from .config_loader import Config
 from .transport import UDPTransport
 from .protocol import MessageType, make_envelope, sha256_hash
@@ -14,6 +16,8 @@ from .storage import Storage
 from .chunk_manager import ChunkManager
 from .replication_manager import ReplicationManager
 from .heartbeat_manager import HeartbeatManager
+from .friend_manager import FriendManager
+from .dm_history import DMHistoryManager
 
 
 class Middleware:
@@ -52,20 +56,22 @@ class Middleware:
         partner_timeout = float(config.get("partner_timeout_sec", 15.0))
         self.partner_heartbeats = HeartbeatManager(partner_timeout)
 
+        # Friend / user state manager (owns persistence for friends + addresses)
+        self.friend_manager = FriendManager(self.username, self.local_ip, self.listen_port)
+
+        # DM history manager (persists DMs per user)
+        state_dir = config.get("state_dir", "state")
+        self.dm_history = DMHistoryManager(self.username, state_dir)
+
+        # Use FriendManager's cache as our user_cache
+        self.user_cache: Dict[str, Tuple[str, int]] = self.friend_manager.user_cache
+
         # Queues
         self.command_queue: Queue = Queue()
         self.event_queue: Queue = self.transport.incoming_queue
 
-        self.user_cache: Dict[str, Tuple[str, int]] = {}
-
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._running = threading.Event()
-
-        # Friend system state
-        self.friends: set[str] = set()
-        self.outgoing_friend_requests: set[str] = set()
-        self.incoming_friend_requests: set[str] = set()
-        self.pending_dm_queues: Dict[str, list[str]] = {}
 
     # ---------- Lifecycle ----------
 
@@ -90,7 +96,7 @@ class Middleware:
     def lookup_user(self, target: str) -> None:
         self._enqueue(("lookup_user", {"target": target}))
 
-    # FRIEND SYSTEM (public API)
+    # Friend system
     def send_friend_request(self, target: str) -> None:
         self._enqueue(("friend_request", {"target": target}))
 
@@ -100,8 +106,16 @@ class Middleware:
     def reject_friend(self, user: str) -> None:
         self._enqueue(("friend_reject", {"user": user}))
 
+    def unfriend(self, user: str) -> None:
+        self._enqueue(("unfriend", {"user": user}))
+
+    # Direct messages
     def send_direct_message(self, target: str, text: str) -> None:
         self._enqueue(("send_dm", {"target": target, "text": text}))
+
+    def get_dm_history(self, peer: str):
+        """Used by the CLI to render DM conversation view."""
+        return self.dm_history.get_history(peer)
 
     # ---------- Internal plumbing ----------
 
@@ -110,12 +124,14 @@ class Middleware:
 
     def _worker_loop(self) -> None:
         while self._running.is_set():
+            # Commands from CLI / external API
             try:
                 cmd = self.command_queue.get(timeout=0.1)
                 self._handle_command(cmd)
             except Exception:
                 pass
 
+            # Network events
             try:
                 env, addr = self.event_queue.get_nowait()
                 self._handle_event(env, addr)
@@ -138,6 +154,8 @@ class Middleware:
             self._do_friend_accept(args["user"])
         elif name == "friend_reject":
             self._do_friend_reject(args["user"])
+        elif name == "unfriend":
+            self._do_unfriend(args["user"])
         elif name == "send_dm":
             self._do_send_dm(args["target"], args["text"])
         else:
@@ -151,7 +169,6 @@ class Middleware:
 
         if msg_type == MessageType.REGISTER_ACK.value:
             print("[middleware] Registration successful.")
-
         elif msg_type == MessageType.REGISTER_FAIL.value:
             print("[middleware] Registration failed (username taken?)")
 
@@ -161,73 +178,49 @@ class Middleware:
             self.room_manager.update_members(room_id, members)
             print(f"[middleware] Joined room {room_id}, members = {members}")
 
-
         elif msg_type == MessageType.FRIEND_REQUEST.value:
-
-            from_user = payload.get("from_user")
-
-            if from_user:
-
-                self.incoming_friend_requests.add(from_user)
-
-                # Cache sender's address if supernode provided it
-
-                friend_ip = payload.get("friend_ip")
-
-                friend_port = payload.get("friend_port")
-
-                if friend_ip and friend_port:
-                    self.user_cache[from_user] = (friend_ip, int(friend_port))
-
-                print(f"[middleware] New friend request from {from_user}.")
+            msg = self.friend_manager.on_friend_request(payload)
+            if msg:
+                print(f"[middleware] {msg}")
 
         elif msg_type == MessageType.FRIEND_RESPONSE.value:
-            from_user = payload.get("from_user")
-            accepted = payload.get("accepted", False)
-            if not from_user:
+            accepted, msg = self.friend_manager.on_friend_response(payload)
+            if msg:
+                print(f"[middleware] {msg}")
+            # If we ever add queued DMs, we could flush them here on accepted=True.
+
+        elif msg_type == MessageType.LOOKUP_RESPONSE.value:
+            user = payload.get("user")
+            found = payload.get("found", False)
+            if not user:
                 return
-
-            # Clear outgoing request entry
-            self.outgoing_friend_requests.discard(from_user)
-
-            if accepted:
-                self.friends.add(from_user)
-                friend_ip = payload.get("friend_ip")
-                friend_port = payload.get("friend_port")
-                if friend_ip and friend_port:
-                    self.user_cache[from_user] = (friend_ip, int(friend_port))
-                print(f"[middleware] {from_user} accepted your friend request.")
-
-                # Flush queued DMs, if any
-                queued = self.pending_dm_queues.pop(from_user, [])
-                if queued:
-                    print(f"[middleware] Delivering {len(queued)} queued DMs to {from_user}...")
-                    for msg in queued:
-                        self._send_dm_direct(from_user, msg)
-            else:
-                print(f"[middleware] {from_user} rejected your friend request.")
-                # Clear any queued messages; they will never be delivered
-                if from_user in self.pending_dm_queues:
-                    dropped = len(self.pending_dm_queues.pop(from_user, []))
-                    if dropped:
-                        print(f"[middleware] Dropped {dropped} queued DMs to {from_user}.")
+            if not found:
+                print(f"[middleware] LOOKUP: user {user} is currently offline or unknown.")
+                return
+            ip = payload.get("ip")
+            port = payload.get("port")
+            if not ip or not port:
+                print(f"[middleware] LOOKUP: malformed response for {user}.")
+                return
+            self.user_cache[user] = (ip, int(port))
+            print(f"[middleware] Refreshed address for {user}: {ip}:{port}")
 
         elif msg_type == MessageType.CHAT.value:
             text = payload.get("text")
             src_user = envelope.get("src_user")
             if payload.get("dm"):
-                print(f"[DM] <{src_user}> {text}")
+                # Direct message: log only; CLI DM view will render it.
+                if src_user:
+                    self.dm_history.log_incoming(src_user, src_user, text)
+                # Do NOT print here, to avoid corrupting the DM menu UI.
             else:
                 room_id = payload.get("room_id")
                 print(f"[{room_id}] <{src_user}> {text}")
-
         elif msg_type == MessageType.NEW_CHUNK.value:
             # Optional: peers could learn about chunks here if you propagate it.
             pass
 
-        else:
-            # ignore other messages for now
-            pass
+        # CHUNK_REQUEST / CHUNK_RESPONSE / HEARTBEAT messages would be handled here later as needed.
 
     # ---------- Command implementations ----------
 
@@ -303,99 +296,51 @@ class Middleware:
         )
         self.transport.send_raw(data, self.supernode_addr)
 
-    def _do_friend_request(self, target: str) -> None:
-        if target == self.username:
-            print("[middleware] You cannot friend yourself.")
-            return
-        if target in self.friends:
-            print(f"[middleware] {target} is already your friend.")
-            return
-        if target in self.outgoing_friend_requests:
-            print(f"[middleware] Friend request already sent to {target}.")
-            return
+    # ---------- Friend commands ----------
 
-        self.outgoing_friend_requests.add(target)
+    def _do_friend_request(self, target: str) -> None:
         lamport = self.lamport.tick()
-        payload = {"target": target}
-        data = make_envelope(
-            MessageType.FRIEND_REQUEST,
-            self.username,
-            self.local_ip,
-            self.listen_port,
-            lamport,
-            payload,
-        )
-        self.transport.send_raw(data, self.supernode_addr)
-        print(f"[middleware] Sent friend request to {target}.")
+        env, msg = self.friend_manager.build_friend_request(target, lamport)
+        if env is not None:
+            self.transport.send_raw(env, self.supernode_addr)
+        if msg:
+            print(f"[middleware] {msg}")
 
     def _do_friend_accept(self, user: str) -> None:
-        if user not in self.incoming_friend_requests:
-            print(f"[middleware] No pending friend request from {user}.")
-            return
-
-        self.incoming_friend_requests.discard(user)
-        self.friends.add(user)
-
         lamport = self.lamport.tick()
-        payload = {
-            "target": user,
-            "accepted": True,
-            "friend_ip": self.local_ip,
-            "friend_port": self.listen_port,
-        }
-        data = make_envelope(
-            MessageType.FRIEND_RESPONSE,
-            self.username,
-            self.local_ip,
-            self.listen_port,
-            lamport,
-            payload,
-        )
-        self.transport.send_raw(data, self.supernode_addr)
-        print(f"[middleware] Accepted friend request from {user}.")
+        env, msg = self.friend_manager.build_friend_accept(user, lamport)
+        if env is not None:
+            self.transport.send_raw(env, self.supernode_addr)
+        if msg:
+            print(f"[middleware] {msg}")
 
     def _do_friend_reject(self, user: str) -> None:
-        if user not in self.incoming_friend_requests:
-            print(f"[middleware] No pending friend request from {user}.")
-            return
-
-        self.incoming_friend_requests.discard(user)
-
         lamport = self.lamport.tick()
-        payload = {
-            "target": user,
-            "accepted": False,
-            # IMPORTANT: no friend_ip/port so we don't reveal details
-        }
-        data = make_envelope(
-            MessageType.FRIEND_RESPONSE,
-            self.username,
-            self.local_ip,
-            self.listen_port,
-            lamport,
-            payload,
-        )
-        self.transport.send_raw(data, self.supernode_addr)
-        print(f"[middleware] Rejected friend request from {user}.")
+        env, msg = self.friend_manager.build_friend_reject(user, lamport)
+        if env is not None:
+            self.transport.send_raw(env, self.supernode_addr)
+        if msg:
+            print(f"[middleware] {msg}")
+
+    def _do_unfriend(self, user: str) -> None:
+        msg = self.friend_manager.unfriend(user)
+        print(f"[middleware] {msg}")
+
+    # ---------- Direct messages ----------
 
     def _do_send_dm(self, target: str, text: str) -> None:
-        if target in self.friends and target in self.user_cache:
-            # We can send immediately
-            self._send_dm_direct(target, text)
+        fm = self.friend_manager
+
+        if target not in fm.friends:
+            print(f"[middleware] {target} is not your friend. Use /friend {target} first.")
             return
 
-        if target in self.friends and target not in self.user_cache:
-            print(f"[middleware] {target} is your friend but no address cached; try again later.")
+        addr = self.user_cache.get(target)
+        if not addr:
+            print(f"[middleware] No address cached for {target} yet.")
             return
 
-        if target in self.outgoing_friend_requests or target in self.incoming_friend_requests:
-            # Queue message until they accept
-            queue = self.pending_dm_queues.setdefault(target, [])
-            queue.append(text)
-            print(f"[middleware] Queued DM to {target} (pending friendship).")
-            return
-
-        print(f"[middleware] {target} is not your friend. Use /friend {target} first.")
+        self._send_dm_direct(target, text)
 
     def _send_dm_direct(self, target: str, text: str) -> None:
         addr = self.user_cache.get(target)
@@ -419,6 +364,10 @@ class Middleware:
             payload,
         )
         self.transport.send_raw(data, (ip, port))
+
+        # Log outgoing DM in DMHistoryManager (persists to disk for this user)
+        self.dm_history.log_outgoing(target, self.username, text)
+
         print(f"[middleware] Sent DM to {target} at {ip}:{port}")
 
     # ---------- Chunk announcement ----------
@@ -430,7 +379,6 @@ class Middleware:
         """
         messages = self.storage.load_chunk(room_id, chunk_id)
         # Serialize the messages to bytes to hash them consistently.
-        import json
         data_bytes = json.dumps(messages, sort_keys=True).encode("utf-8")
         digest = sha256_hash(data_bytes)
 
@@ -460,5 +408,8 @@ class Middleware:
         try:
             s.connect(("8.8.8.8", 80))
             return s.getsockname()[0]
+        except OSError:
+            # fallback
+            return "127.0.0.1"
         finally:
             s.close()
