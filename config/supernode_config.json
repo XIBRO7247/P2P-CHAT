@@ -1,0 +1,6 @@
+{
+  "bind_host": "0.0.0.0",
+  "bind_port": 50000,
+  "admin_only_actions": ["push_update", "promote_anchor"],
+  "enable_admin_auth": true
+}

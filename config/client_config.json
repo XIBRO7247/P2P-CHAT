@@ -1,0 +1,26 @@
+{
+  "supernode_host": "127.0.0.1",
+  "supernode_port": 50000,
+  "listen_port_start": 50010,
+  "listen_port_end": 50050,
+
+  "chunk_size_messages": 20,
+  "heartbeat_interval_sec": 5.0,
+  "partner_timeout_sec": 15.0,
+  "supernode_timeout_sec": 15.0,
+
+  "logging": {
+    "level": "info",
+    "file": "p2pchat.log"
+  },
+
+  "replication_policy": {
+    "min_replicas": 2,
+    "scale_thresholds": {
+      "5": 2,
+      "100": 5,
+      "2000": 10,
+      "5000": 20
+    }
+  }
+}
