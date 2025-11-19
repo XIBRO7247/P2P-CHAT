@@ -1,6 +1,7 @@
 *.json
 !/config/client_config.json
 !/config/supernode_config.json
+!/config/commands.json
 
 chunks_*
 

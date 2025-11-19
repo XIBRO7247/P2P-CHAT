@@ -1,0 +1,79 @@
+{
+  "commands": {
+    "room": {
+      "help": "/room ... - room utilities (currently just alias of /join)",
+      "subcommands": {
+        "join": {
+          "handler": "self._cmd_join",
+          "help": "/room join <room> - join or create a room",
+          "min_args": 1
+        },
+        "msg": {
+        "handler": "self._cmd_msg",
+        "help": "/msg <room> <text> - send message to room",
+        "min_args": 2
+        }
+      }
+    },
+    "friend": {
+      "help": "/friend ... - manage friends",
+      "subcommands": {
+        "add": {
+          "handler": "self._cmd_friend_add",
+          "help": "/friend add <user> - send friend request",
+          "min_args": 1
+        },
+        "request": {
+          "handler": "self._cmd_friend_add",
+          "help": "/friend request <user> - alias of add",
+          "min_args": 1
+        },
+        "accept": {
+          "handler": "self._cmd_friend_accept",
+          "help": "/friend accept <user> - accept friend request",
+          "min_args": 1
+        },
+        "reject": {
+          "handler": "self._cmd_friend_reject",
+          "help": "/friend reject <user> - reject friend request",
+          "min_args": 1
+        },
+        "remove": {
+          "handler": "self._cmd_friend_remove",
+          "help": "/friend remove <user> - unfriend user",
+          "min_args": 1
+        },
+        "list": {
+          "handler": "self._cmd_friend_list",
+          "help": "/friend list - list friends",
+          "min_args": 0
+        },
+        "requests": {
+          "handler": "self._cmd_friend_requests",
+          "help": "/friend requests - list incoming friend requests",
+          "min_args": 0
+        }
+      }
+    },
+    "dm": {
+      "handler": "self._cmd_dm",
+      "help": "/dm <user> [text] - open DM view (optionally send first message)",
+      "min_args": 1
+    },
+    "help": {
+      "handler": "self._cmd_help",
+      "help": "/help - show available commands",
+      "min_args": 0
+    },
+    "exit": {
+      "handler": "self._cmd_exit",
+      "help": "/exit - exit client",
+      "min_args": 0
+    },
+    "quit": {
+      "handler": "self._cmd_exit",
+      "help": "/quit - exit client",
+      "min_args": 0
+    }
+  }
+}
