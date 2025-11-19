@@ -21,6 +21,9 @@ class MessageType(str, Enum):
     # Friend system
     FRIEND_REQUEST = "FRIEND_REQUEST"
     FRIEND_RESPONSE = "FRIEND_RESPONSE"
+    FRIEND_INTRO = "FRIEND_INTRO"   # friend-of-a-friend introduction (peer <-> peer)
+    FRIEND_INTRO_RESULT = "FRIEND_INTRO_RESULT"
+
 
     # Data
     CHAT = "CHAT"

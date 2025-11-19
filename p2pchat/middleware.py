@@ -2,6 +2,7 @@
 
 import socket
 import threading
+import time
 from queue import Queue
 from typing import Any, Dict, Tuple
 
@@ -18,6 +19,7 @@ from .replication_manager import ReplicationManager
 from .heartbeat_manager import HeartbeatManager
 from .friend_manager import FriendManager
 from .dm_history import DMHistoryManager
+from .room_history import RoomHistoryManager
 
 
 class Middleware:
@@ -59,19 +61,29 @@ class Middleware:
         # Friend / user state manager (owns persistence for friends + addresses)
         self.friend_manager = FriendManager(self.username, self.local_ip, self.listen_port)
 
-        # DM history manager (persists DMs per user)
+        # Persistent history managers (per local user)
         state_dir = config.get("state_dir", "state")
         self.dm_history = DMHistoryManager(self.username, state_dir)
+        self.room_history = RoomHistoryManager(self.username, state_dir)
 
         # Use FriendManager's cache as our user_cache
         self.user_cache: Dict[str, Tuple[str, int]] = self.friend_manager.user_cache
 
-        # Queues
+        # Command + event queues
         self.command_queue: Queue = Queue()
         self.event_queue: Queue = self.transport.incoming_queue
 
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._running = threading.Event()
+
+        # Pending friend-intro (friend-of-a-friend) lookups:
+        # target_username -> {
+        #   "waiting_for": set(friend_names),
+        #   "got_helper": bool,
+        #   "deadline": float
+        # }
+        self.pending_intros: Dict[str, Dict[str, Any]] = {}
+        self.intro_timeout_sec = float(config.get("friend_intro_timeout_sec", 2.0))
 
     # ---------- Lifecycle ----------
 
@@ -100,6 +112,10 @@ class Middleware:
     def send_friend_request(self, target: str) -> None:
         self._enqueue(("friend_request", {"target": target}))
 
+    def send_friend_request_via(self, mutual: str, target: str) -> None:
+        """Optional explicit 'via' API if needed later by the CLI."""
+        self._enqueue(("friend_request_via", {"mutual": mutual, "target": target}))
+
     def accept_friend(self, user: str) -> None:
         self._enqueue(("friend_accept", {"user": user}))
 
@@ -116,6 +132,11 @@ class Middleware:
     def get_dm_history(self, peer: str):
         """Used by the CLI to render DM conversation view."""
         return self.dm_history.get_history(peer)
+
+    # Room history (for /room msg sessions)
+    def get_room_history(self, room_id: str):
+        """Used by the CLI to render room conversation view."""
+        return self.room_history.get_history(room_id)
 
     # ---------- Internal plumbing ----------
 
@@ -138,6 +159,9 @@ class Middleware:
             except Exception:
                 pass
 
+            # Timeouts for friend-intro attempts
+            self._check_intro_timeouts()
+
     def _handle_command(self, cmd) -> None:
         name, args = cmd
         if name == "register":
@@ -150,6 +174,8 @@ class Middleware:
             self._do_lookup_user(args["target"])
         elif name == "friend_request":
             self._do_friend_request(args["target"])
+        elif name == "friend_request_via":
+            self._do_friend_request_via(args["mutual"], args["target"])
         elif name == "friend_accept":
             self._do_friend_accept(args["user"])
         elif name == "friend_reject":
@@ -169,6 +195,7 @@ class Middleware:
 
         if msg_type == MessageType.REGISTER_ACK.value:
             print("[middleware] Registration successful.")
+
         elif msg_type == MessageType.REGISTER_FAIL.value:
             print("[middleware] Registration failed (username taken?)")
 
@@ -215,10 +242,22 @@ class Middleware:
                 # Do NOT print here, to avoid corrupting the DM menu UI.
             else:
                 room_id = payload.get("room_id")
+                if room_id and src_user:
+                    # Log incoming room message for room session view
+                    self.room_history.log_incoming(room_id, src_user, text)
                 print(f"[{room_id}] <{src_user}> {text}")
+
         elif msg_type == MessageType.NEW_CHUNK.value:
             # Optional: peers could learn about chunks here if you propagate it.
             pass
+
+        elif msg_type == MessageType.FRIEND_INTRO.value:
+            # "Do you know <target>?" from requester
+            self._handle_friend_intro(envelope)
+
+        elif msg_type == MessageType.FRIEND_INTRO_RESULT.value:
+            # Response from mutual friend: can/can't help
+            self._handle_friend_intro_result(envelope)
 
         # CHUNK_REQUEST / CHUNK_RESPONSE / HEARTBEAT messages would be handled here later as needed.
 
@@ -283,6 +322,9 @@ class Middleware:
         if chunk_id:
             self._announce_new_chunk(room_id, chunk_id)
 
+        # Log outgoing room message to room history (for room session UI)
+        self.room_history.log_outgoing(room_id, self.username, text)
+
     def _do_lookup_user(self, target: str) -> None:
         lamport = self.lamport.tick()
         payload = {"target": target}
@@ -299,18 +341,111 @@ class Middleware:
     # ---------- Friend commands ----------
 
     def _do_friend_request(self, target: str) -> None:
+        """
+        /friend add <target> behaviour:
+
+        1) Check which of my friends are online (have cached address).
+        2) Ask each online friend via FRIEND_INTRO if they know 'target'.
+        3) If at least one can help, they relay a direct FRIEND_REQUEST to 'target'.
+        4) If *none* can help (all say no or timeout), fall back to supernode.
+        """
+        friends = self.friend_manager.friends
+        online_friends = [f for f in friends if f in self.user_cache]
+
+        if not online_friends:
+            # No-one to ask → go straight to supernode (old behaviour).
+            lamport = self.lamport.tick()
+            env, msg = self.friend_manager.build_friend_request(target, lamport)
+            if env is not None:
+                self.transport.send_raw(env, self.supernode_addr)
+            if msg:
+                print(f"[middleware] {msg}")
+            return
+
+        # Initialise pending intro state for this target
+        self.pending_intros[target] = {
+            "waiting_for": set(online_friends),
+            "got_helper": False,
+            "deadline": time.time() + self.intro_timeout_sec,
+        }
+
         lamport = self.lamport.tick()
-        env, msg = self.friend_manager.build_friend_request(target, lamport)
-        if env is not None:
-            self.transport.send_raw(env, self.supernode_addr)
-        if msg:
-            print(f"[middleware] {msg}")
+        payload = {
+            "requester": self.username,
+            "target": target,
+        }
+        env = make_envelope(
+            MessageType.FRIEND_INTRO,
+            self.username,
+            self.local_ip,
+            self.listen_port,
+            lamport,
+            payload,
+        )
+
+        for friend in online_friends:
+            ip, port = self.user_cache[friend]
+            self.transport.send_raw(env, (ip, port))
+
+        print(
+            f"[middleware] Asked online friends to introduce me to {target}: "
+            f"{', '.join(online_friends)}"
+        )
+
+    def _do_friend_request_via(self, mutual: str, target: str) -> None:
+        """
+        Optional explicit 'via' command if the CLI ever calls it:
+        /friend via <mutual> <target>
+        Behaves like a one-friend intro.
+        """
+        if mutual not in self.friend_manager.friends:
+            print(f"[middleware] Cannot use {mutual} as relay: they are not your friend.")
+            return
+
+        addr = self.user_cache.get(mutual)
+        if not addr:
+            print(f"[middleware] No address cached for relay friend {mutual}.")
+            return
+
+        # Set up a pending intro with only this mutual
+        self.pending_intros[target] = {
+            "waiting_for": {mutual},
+            "got_helper": False,
+            "deadline": time.time() + self.intro_timeout_sec,
+        }
+
+        ip, port = addr
+        lamport = self.lamport.tick()
+        payload = {
+            "requester": self.username,
+            "target": target,
+        }
+        env = make_envelope(
+            MessageType.FRIEND_INTRO,
+            self.username,
+            self.local_ip,
+            self.listen_port,
+            lamport,
+            payload,
+        )
+        self.transport.send_raw(env, (ip, port))
+        print(f"[middleware] Sent friend introduction request for {target} via {mutual}.")
 
     def _do_friend_accept(self, user: str) -> None:
         lamport = self.lamport.tick()
         env, msg = self.friend_manager.build_friend_accept(user, lamport)
         if env is not None:
+            # 1) Try to send P2P directly to the requester (e.g. cameron)
+            addr = self.user_cache.get(user)
+            if addr:
+                self.transport.send_raw(env, addr)
+                print(f"[middleware] Sent FRIEND_RESPONSE directly to {user} at {addr[0]}:{addr[1]}")
+            else:
+                print(f"[middleware] No cached address for {user}; skipping direct FRIEND_RESPONSE.")
+
+            # 2) Also send to supernode as a ledger entry (optional)
             self.transport.send_raw(env, self.supernode_addr)
+
         if msg:
             print(f"[middleware] {msg}")
 
@@ -318,7 +453,15 @@ class Middleware:
         lamport = self.lamport.tick()
         env, msg = self.friend_manager.build_friend_reject(user, lamport)
         if env is not None:
-            self.transport.send_raw(env, self.supernode_addr)
+            # You can choose to send rejections only P2P, or also to supernode.
+            addr = self.user_cache.get(user)
+            if addr:
+                self.transport.send_raw(env, addr)
+                print(f"[middleware] Sent FRIEND_RESPONSE (reject) directly to {user} at {addr[0]}:{addr[1]}")
+            else:
+                print(f"[middleware] No cached address for {user}; skipping direct reject.")
+            # Optionally *not* send reject to supernode if you don't want it logged.
+            # self.transport.send_raw(env, self.supernode_addr)
         if msg:
             print(f"[middleware] {msg}")
 
@@ -326,13 +469,179 @@ class Middleware:
         msg = self.friend_manager.unfriend(user)
         print(f"[middleware] {msg}")
 
+    # ---------- Friend intro handlers ----------
+
+    def _handle_friend_intro(self, envelope: Dict[str, Any]) -> None:
+        """
+        Handle FRIEND_INTRO (query):
+
+        payload:
+          - requester: user who wants to befriend 'target'
+          - target:    desired friend
+
+        Behaviour on this node (mutual candidate):
+          - If we're NOT friends with 'target' or don't know their address:
+            send FRIEND_INTRO_RESULT(can_help=False) back to requester.
+          - If we ARE friends with 'target' and have their address:
+            1) send FRIEND_INTRO_RESULT(can_help=True) back to requester.
+            2) send a direct FRIEND_REQUEST to 'target' on behalf of 'requester',
+               including the requester's IP/port for P2P DM.
+        """
+        payload = envelope.get("payload", {}) or {}
+        requester = payload.get("requester")
+        target = payload.get("target")
+        if not requester or not target:
+            return
+
+        requester_ip = envelope.get("src_ip")
+        requester_port = envelope.get("src_port")
+        if not requester_ip or not requester_port:
+            return
+
+        helper_name = self.username
+
+        # Do we know 'target' as a friend and have an address?
+        can_help = (
+            target in self.friend_manager.friends and
+            target in self.user_cache
+        )
+
+        # 1) Reply to requester with FRIEND_INTRO_RESULT
+        lamport_res = self.lamport.tick()
+        result_payload = {
+            "requester": requester,
+            "target": target,
+            "helper": helper_name,
+            "can_help": bool(can_help),
+        }
+        result_env = make_envelope(
+            MessageType.FRIEND_INTRO_RESULT,
+            helper_name,
+            self.local_ip,
+            self.listen_port,
+            lamport_res,
+            result_payload,
+        )
+        self.transport.send_raw(result_env, (requester_ip, int(requester_port)))
+
+        if not can_help:
+            print(
+                f"[middleware] Intro: {requester} asked me to introduce them to {target}, "
+                f"but I'm not friends with {target} or lack address."
+            )
+            return
+
+        # 2) We can help: send direct FRIEND_REQUEST to 'target' on behalf of 'requester'
+        target_ip, target_port = self.user_cache[target]
+        lamport_req = self.lamport.tick()
+        forward_payload = {
+            "from_user": requester,
+            "friend_ip": requester_ip,
+            "friend_port": int(requester_port),
+            # optional extra context:
+            "via": helper_name,
+        }
+        env_req = make_envelope(
+            MessageType.FRIEND_REQUEST,
+            requester,            # logical src_user is the real requester
+            requester_ip,         # advertised src_ip = requester's ip
+            int(requester_port),  # advertised src_port = requester's port
+            lamport_req,
+            forward_payload,
+        )
+        self.transport.send_raw(env_req, (target_ip, target_port))
+
+        print(
+            f"[middleware] Intro: relayed friend request from {requester} to {target} directly."
+        )
+
+    def _handle_friend_intro_result(self, envelope: Dict[str, Any]) -> None:
+        """
+        Handle FRIEND_INTRO_RESULT on the requester side.
+
+        payload:
+          - requester: should be this.username
+          - target:    the user we're trying to add
+          - helper:    which friend answered
+          - can_help:  bool
+        """
+        payload = envelope.get("payload", {}) or {}
+        requester = payload.get("requester")
+        target = payload.get("target")
+        helper = payload.get("helper") or envelope.get("src_user")
+        can_help = bool(payload.get("can_help", False))
+
+        if requester != self.username or not target or not helper:
+            return
+
+        state = self.pending_intros.get(target)
+        if not state:
+            # No active intro for this target anymore.
+            return
+
+        waiting_for: set = state["waiting_for"]
+        waiting_for.discard(helper)
+
+        if can_help:
+            state["got_helper"] = True
+            print(
+                f"[middleware] Intro: {helper} can introduce me to {target}; "
+                f"waiting for their direct friend request to complete."
+            )
+
+        # If we've heard back from everyone and no-one can help,
+        # we fall back to the supernode.
+        if not waiting_for and not state["got_helper"]:
+            print(
+                f"[middleware] Intro: no online friends could introduce me to {target}, "
+                f"falling back to supernode."
+            )
+            lamport = self.lamport.tick()
+            env, msg = self.friend_manager.build_friend_request(target, lamport)
+            if env is not None:
+                self.transport.send_raw(env, self.supernode_addr)
+            if msg:
+                print(f"[middleware] {msg}")
+            # Remove from pending intros
+            self.pending_intros.pop(target, None)
+
+    def _check_intro_timeouts(self) -> None:
+        """
+        Periodically called from _worker_loop to handle intro timeouts.
+        If an intro is still pending and no helper has responded by the deadline,
+        we fall back to the supernode.
+        """
+        if not self.pending_intros:
+            return
+
+        now = time.time()
+        expired_targets = [
+            t for t, st in self.pending_intros.items()
+            if not st["got_helper"] and st["deadline"] <= now
+        ]
+
+        for target in expired_targets:
+            st = self.pending_intros.pop(target, None)
+            if not st:
+                continue
+            print(
+                f"[middleware] Intro timeout: no response from friends for {target}, "
+                f"falling back to supernode."
+            )
+            lamport = self.lamport.tick()
+            env, msg = self.friend_manager.build_friend_request(target, lamport)
+            if env is not None:
+                self.transport.send_raw(env, self.supernode_addr)
+            if msg:
+                print(f"[middleware] {msg}")
+
     # ---------- Direct messages ----------
 
     def _do_send_dm(self, target: str, text: str) -> None:
         fm = self.friend_manager
 
         if target not in fm.friends:
-            print(f"[middleware] {target} is not your friend. Use /friend {target} first.")
+            print(f"[middleware] {target} is not your friend. Use /friend add {target} first.")
             return
 
         addr = self.user_cache.get(target)

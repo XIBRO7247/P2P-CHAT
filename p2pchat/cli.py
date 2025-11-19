@@ -122,6 +122,88 @@ class CLI:
             stop_event.set()
             ui_thread.join(timeout=1.0)
 
+    # ---------- ROOM mode (multi-threaded view) ----------
+
+    def _room_session(self, room_id: str, first_msg: str | None = None) -> None:
+        """
+        Interactive room chat mode.
+
+        - Ensures we are joined to the room.
+        - Optionally sends an initial message.
+        - Background thread tails room history and prints new messages.
+        - Main thread reads user input and sends room messages.
+        - /home or /exit returns to main menu.
+        """
+        # Make sure we are in the room
+        self.middleware.join_room(room_id)
+
+        # Optional first message, e.g. /room msg <room> hello world
+        if first_msg:
+            self.middleware.send_room_message(room_id, first_msg)
+
+        # Initial render
+        self._clear_screen()
+        history = self.middleware.get_room_history(room_id)
+        print(f"=== Room: {room_id} ===")
+        if not history:
+            print("(no messages yet)")
+        else:
+            for sender, text in history:
+                label = "me" if sender == self.middleware.username else sender
+                print(f"[{label}] {text}")
+
+        print("\nType a message and press Enter.")
+        print("Commands: /home or /exit to return to main menu.")
+        print("(New messages will appear below as they arrive.)")
+
+        last_len = len(history)
+        stop_event = threading.Event()
+
+        def ui_loop():
+            nonlocal last_len
+            while not stop_event.is_set():
+                try:
+                    current = self.middleware.get_room_history(room_id)
+                except Exception:
+                    time.sleep(0.2)
+                    continue
+
+                if len(current) > last_len:
+                    new_msgs = current[last_len:]
+                    for sender, text in new_msgs:
+                        label = "me" if sender == self.middleware.username else sender
+                        print(f"\n[{label}] {text}", flush=True)
+                    last_len = len(current)
+                    print("room> ", end="", flush=True)
+
+                time.sleep(0.2)
+
+        ui_thread = threading.Thread(target=ui_loop, daemon=True)
+        ui_thread.start()
+
+        try:
+            while True:
+                try:
+                    line = input("room> ")
+                except KeyboardInterrupt:
+                    print()
+                    break
+
+                text = line.strip()
+
+                if text == "":
+                    continue
+
+                if text in ("/home", "/exit"):
+                    break
+
+                # Normal room message
+                self.middleware.send_room_message(room_id, text)
+
+        finally:
+            stop_event.set()
+            ui_thread.join(timeout=1.0)
+
     # ---------- Command dispatcher (JSON-driven) ----------
 
     def _dispatch_command(self, line: str) -> bool:
@@ -188,13 +270,13 @@ class CLI:
 
     # ---------- Individual command handlers ----------
 
-    # /join <room>
+    # /join <room>  (if you still use a top-level /join)
     def _cmd_join(self, args: list[str]) -> bool:
         room = args[0]
         self.middleware.join_room(room)
         return False
 
-    # /msg <room> <text...>
+    # /msg <room> <text...>  (if you still use a top-level /msg)
     def _cmd_msg(self, args: list[str]) -> bool:
         if len(args) < 2:
             print("[cli] Usage: /msg <room> <text>")
@@ -202,6 +284,20 @@ class CLI:
         room = args[0]
         text = " ".join(args[1:])
         self.middleware.send_room_message(room, text)
+        return False
+
+    # /room msg <room> [text...]
+    def _cmd_room_msg(self, args: list[str]) -> bool:
+        room = args[0]
+        first_msg = " ".join(args[1:]) if len(args) > 1 else None
+        self._room_session(room, first_msg=first_msg)
+        return False
+
+    # Optional: /room join <room> if you add it in commands.json
+    def _cmd_room_join(self, args: list[str]) -> bool:
+        room = args[0]
+        self.middleware.join_room(room)
+        print(f"[cli] Joined room {room}. Use /room msg {room} to open a chat view.")
         return False
 
     # /friend add/request <user>

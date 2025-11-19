@@ -1,17 +1,17 @@
 {
   "commands": {
     "room": {
-      "help": "/room ... - room utilities (currently just alias of /join)",
+      "help": "/room ... - room utilities",
       "subcommands": {
-        "join": {
-          "handler": "self._cmd_join",
-          "help": "/room join <room> - join or create a room",
+        "msg": {
+          "handler": "self._cmd_room_msg",
+          "help": "/room msg <room> [text] - open room chat (optionally send first message)",
           "min_args": 1
         },
-        "msg": {
-        "handler": "self._cmd_msg",
-        "help": "/msg <room> <text> - send message to room",
-        "min_args": 2
+        "join": {
+          "handler": "self._cmd_room_join",
+          "help": "/room join <room> - join or create a room (no dedicated view)",
+          "min_args": 1
         }
       }
     },

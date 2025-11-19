@@ -36,7 +36,6 @@ class Supernode:
         print(f"[supernode] Listening on {self.host}:{self.port}")
         print(f"[supernode] LAN address (for clients): {lan_ip}:{self.port}")
 
-
     def stop(self):
         self._running.clear()
         self.sock.close()
@@ -78,7 +77,10 @@ class Supernode:
             self._handle_friend_request(src_user, payload)
         elif msg_type == MessageType.FRIEND_RESPONSE.value:
             self._handle_friend_response(src_user, payload)
+        elif msg_type == MessageType.LOOKUP_USER.value:
+            self._handle_lookup_user(src_user, addr, payload)
         else:
+            # Ignore unknown or peer-only types such as FRIEND_INTRO, etc.
             pass
 
     def _send(self, data: bytes, addr) -> None:
@@ -180,8 +182,12 @@ class Supernode:
     def _handle_friend_request(self, src_user: str, payload: Dict[str, Any]) -> None:
         """
         Sender -> supernode -> recipient.
+
         Payload from sender: {"target": "<username>"}.
         Payload to recipient: {"from_user": src_user, "friend_ip", "friend_port"}.
+
+        Note: src_user may be the *real requester* even if the datagram
+        came from a relay peer (friend-of-a-friend flow).
         """
         target = payload.get("target")
         if not target:
@@ -221,6 +227,7 @@ class Supernode:
     def _handle_friend_response(self, src_user: str, payload: Dict[str, Any]) -> None:
         """
         Recipient -> supernode -> original requester.
+
         Payload from recipient: {"target": "<requester>", "accepted": bool,
                                  "friend_ip"?, "friend_port"?}.
         Payload to requester:   {"from_user": src_user, "accepted": bool,
@@ -263,6 +270,45 @@ class Supernode:
         )
         self._send(env, (ip, port))
 
+    def _handle_lookup_user(self, src_user: str, addr, payload: Dict[str, Any]) -> None:
+        """
+        Handle LOOKUP_USER from a client.
+
+        Payload from client: {"target": "<username>"}
+        Response payload:    {"user": "<username>", "found": bool,
+                              "ip"?, "port"?}
+        """
+        target = payload.get("target")
+        if not target:
+            return
+
+        ep = self.users.get(target)
+        if ep is None:
+            print(f"[supernode] LOOKUP_USER from {src_user}: {target} not found/online")
+            resp_payload = {
+                "user": target,
+                "found": False,
+            }
+        else:
+            ip, port = ep
+            print(f"[supernode] LOOKUP_USER from {src_user}: {target} -> {ip}:{port}")
+            resp_payload = {
+                "user": target,
+                "found": True,
+                "ip": ip,
+                "port": port,
+            }
+
+        env = make_envelope(
+            MessageType.LOOKUP_RESPONSE,
+            "supernode",
+            self.host,
+            self.port,
+            self.lamport.tick(),
+            resp_payload,
+        )
+        self._send(env, addr)
+
     @staticmethod
     def _guess_lan_ip() -> str:
         """
@@ -278,7 +324,6 @@ class Supernode:
             return "127.0.0.1"
         finally:
             s.close()
-
 
 
 if __name__ == "__main__":
