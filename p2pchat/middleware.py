@@ -1,10 +1,8 @@
-# p2pchat/middleware.py
-
 import socket
 import threading
 import time
-from queue import Queue
-from typing import Any, Dict, Tuple
+from queue import Queue, Empty
+from typing import Any, Dict, Tuple, Optional
 
 import json
 
@@ -85,6 +83,10 @@ class Middleware:
         self.pending_intros: Dict[str, Dict[str, Any]] = {}
         self.intro_timeout_sec = float(config.get("friend_intro_timeout_sec", 2.0))
 
+        # Live listeners for DMs and rooms: peer/room_id -> list[Queue]
+        self.dm_listeners: Dict[str, list[Queue]] = {}
+        self.room_listeners: Dict[str, list[Queue]] = {}
+
     # ---------- Lifecycle ----------
 
     def start(self) -> None:
@@ -138,6 +140,60 @@ class Middleware:
         """Used by the CLI to render room conversation view."""
         return self.room_history.get_history(room_id)
 
+    # ---------- Listener registration (for CLI live views) ----------
+
+    def register_dm_listener(self, peer: str) -> Queue:
+        """Return a queue that will receive (sender, text) for DMs with 'peer'."""
+        q: Queue = Queue()
+        self.dm_listeners.setdefault(peer, []).append(q)
+        return q
+
+    def unregister_dm_listener(self, peer: str, q: Queue) -> None:
+        lst = self.dm_listeners.get(peer)
+        if not lst:
+            return
+        if q in lst:
+            lst.remove(q)
+        if not lst:
+            self.dm_listeners.pop(peer, None)
+
+    def register_room_listener(self, room_id: str) -> Queue:
+        """Return a queue that will receive (sender, text) for messages in 'room_id'."""
+        q: Queue = Queue()
+        self.room_listeners.setdefault(room_id, []).append(q)
+        return q
+
+    def unregister_room_listener(self, room_id: str, q: Queue) -> None:
+        lst = self.room_listeners.get(room_id)
+        if not lst:
+            return
+        if q in lst:
+            lst.remove(q)
+        if not lst:
+            self.room_listeners.pop(room_id, None)
+
+    # Internal notifiers
+
+    def _notify_dm_listeners(self, peer: str, sender: str, text: str) -> None:
+        queues = self.dm_listeners.get(peer)
+        if not queues:
+            return
+        for q in list(queues):
+            try:
+                q.put_nowait((sender, text))
+            except Exception:
+                pass
+
+    def _notify_room_listeners(self, room_id: str, sender: str, text: str) -> None:
+        queues = self.room_listeners.get(room_id)
+        if not queues:
+            return
+        for q in list(queues):
+            try:
+                q.put_nowait((sender, text))
+            except Exception:
+                pass
+
     # ---------- Internal plumbing ----------
 
     def _enqueue(self, cmd) -> None:
@@ -145,19 +201,35 @@ class Middleware:
 
     def _worker_loop(self) -> None:
         while self._running.is_set():
-            # Commands from CLI / external API
+            # ---- Commands from CLI / external API ----
             try:
                 cmd = self.command_queue.get(timeout=0.1)
-                self._handle_command(cmd)
-            except Exception:
-                pass
+            except Empty:
+                cmd = None
+            except Exception as e:
+                print(f"[middleware] Error getting command: {e!r}")
+                cmd = None
 
-            # Network events
-            try:
-                env, addr = self.event_queue.get_nowait()
-                self._handle_event(env, addr)
-            except Exception:
-                pass
+            if cmd is not None:
+                try:
+                    self._handle_command(cmd)
+                except Exception as e:
+                    print(f"[middleware] Error handling command {cmd!r}: {e!r}")
+
+            # ---- Network events: drain the queue ----
+            while True:
+                try:
+                    env, addr = self.event_queue.get_nowait()
+                except Empty:
+                    break
+                except Exception as e:
+                    print(f"[middleware] Error getting event: {e!r}")
+                    break
+
+                try:
+                    self._handle_event(env, addr)
+                except Exception as e:
+                    print(f"[middleware] Error handling event: {e!r}")
 
             # Timeouts for friend-intro attempts
             self._check_intro_timeouts()
@@ -235,17 +307,30 @@ class Middleware:
         elif msg_type == MessageType.CHAT.value:
             text = payload.get("text")
             src_user = envelope.get("src_user")
-            if payload.get("dm"):
-                # Direct message: log only; CLI DM view will render it.
-                if src_user:
-                    self.dm_history.log_incoming(src_user, src_user, text)
-                # Do NOT print here, to avoid corrupting the DM menu UI.
+            room_id = payload.get("room_id")
+            target = payload.get("target")
+
+            # DM if:
+            #   - explicit dm flag, OR
+            #   - no room_id AND target == me
+            dm_flag = bool(payload.get("dm"))
+            is_dm = dm_flag or (room_id is None and target == self.username)
+
+            if is_dm:
+                if src_user and text is not None:
+                    # For the receiver, peer is the *other* user (src_user)
+                    peer = src_user
+                    try:
+                        self.dm_history.log_incoming(peer, src_user, text)
+                        self._notify_dm_listeners(peer, src_user, text)
+                        # Do NOT print here in normal flow – the DM view handles it
+                    except Exception as e:
+                        print(f"[middleware] Error logging DM from {src_user}: {e!r}")
             else:
-                room_id = payload.get("room_id")
-                if room_id and src_user:
-                    # Log incoming room message for room session view
+                if room_id and src_user and text is not None:
                     self.room_history.log_incoming(room_id, src_user, text)
-                print(f"[{room_id}] <{src_user}> {text}")
+                    self._notify_room_listeners(room_id, src_user, text)
+                    print(f"[{room_id}] <{src_user}> {text}")
 
         elif msg_type == MessageType.NEW_CHUNK.value:
             # Optional: peers could learn about chunks here if you propagate it.
@@ -259,7 +344,51 @@ class Middleware:
             # Response from mutual friend: can/can't help
             self._handle_friend_intro_result(envelope)
 
-        # CHUNK_REQUEST / CHUNK_RESPONSE / HEARTBEAT messages would be handled here later as needed.
+        # ---- Heartbeats for IP/port identity checks ----
+        elif msg_type == MessageType.PARTNER_HEARTBEAT.value:
+            src_user = envelope.get("src_user")
+            if src_user:
+                # Mark this user alive at this moment
+                self.partner_heartbeats.register_heartbeat(src_user)
+                # Also refresh the address for this src_user
+                ip, port = addr
+                self.user_cache[src_user] = (ip, int(port))
+
+            # Reply with ACK so the requester can confirm identity
+            lamport = self.lamport.tick()
+            ack_payload: Dict[str, Any] = {}
+            ack = make_envelope(
+                MessageType.PARTNER_HEARTBEAT_ACK,
+                self.username,
+                self.local_ip,
+                self.listen_port,
+                lamport,
+                ack_payload,
+            )
+            self.transport.send_raw(ack, addr)
+
+        elif msg_type == MessageType.PARTNER_HEARTBEAT_ACK.value:
+            # Just record that this peer is alive and update its address.
+            src_user = envelope.get("src_user")
+            if src_user:
+                self.partner_heartbeats.register_heartbeat(src_user)
+                ip, port = addr
+                self.user_cache[src_user] = (ip, int(port))
+            # Identity confirmation is handled in the synchronous verifier.
+
+        # ---- Friend address queries / updates ----
+        elif msg_type == MessageType.FRIEND_ADDR_QUERY.value:
+            self._handle_friend_addr_query(envelope, addr)
+
+        elif msg_type == MessageType.FRIEND_ADDR_ANSWER.value:
+            # Answers are consumed by the synchronous resolver;
+            # we don't do generic handling here.
+            pass
+
+        elif msg_type == MessageType.FRIEND_ADDR_UPDATE.value:
+            self._handle_friend_addr_update(envelope, addr)
+
+        # CHUNK_REQUEST / CHUNK_RESPONSE / HASH_ERROR could be handled later as needed.
 
     # ---------- Command implementations ----------
 
@@ -322,8 +451,9 @@ class Middleware:
         if chunk_id:
             self._announce_new_chunk(room_id, chunk_id)
 
-        # Log outgoing room message to room history (for room session UI)
+        # Log outgoing room message + notify listeners
         self.room_history.log_outgoing(room_id, self.username, text)
+        self._notify_room_listeners(room_id, self.username, text)
 
     def _do_lookup_user(self, target: str) -> None:
         lamport = self.lamport.tick()
@@ -435,7 +565,7 @@ class Middleware:
         lamport = self.lamport.tick()
         env, msg = self.friend_manager.build_friend_accept(user, lamport)
         if env is not None:
-            # 1) Try to send P2P directly to the requester (e.g. cameron)
+            # 1) Try to send P2P directly to the requester
             addr = self.user_cache.get(user)
             if addr:
                 self.transport.send_raw(env, addr)
@@ -453,14 +583,13 @@ class Middleware:
         lamport = self.lamport.tick()
         env, msg = self.friend_manager.build_friend_reject(user, lamport)
         if env is not None:
-            # You can choose to send rejections only P2P, or also to supernode.
             addr = self.user_cache.get(user)
             if addr:
                 self.transport.send_raw(env, addr)
                 print(f"[middleware] Sent FRIEND_RESPONSE (reject) directly to {user} at {addr[0]}:{addr[1]}")
             else:
                 print(f"[middleware] No cached address for {user}; skipping direct reject.")
-            # Optionally *not* send reject to supernode if you don't want it logged.
+            # If you want the supernode to also know about rejections, uncomment:
             # self.transport.send_raw(env, self.supernode_addr)
         if msg:
             print(f"[middleware] {msg}")
@@ -471,21 +600,13 @@ class Middleware:
 
     # ---------- Friend intro handlers ----------
 
-    def _handle_friend_intro(self, envelope: Dict[str, Any]) -> None:
+    def _handle_friend_intro(self, envelope: Dict[str, Any], addr) -> None:
         """
         Handle FRIEND_INTRO (query):
 
         payload:
           - requester: user who wants to befriend 'target'
           - target:    desired friend
-
-        Behaviour on this node (mutual candidate):
-          - If we're NOT friends with 'target' or don't know their address:
-            send FRIEND_INTRO_RESULT(can_help=False) back to requester.
-          - If we ARE friends with 'target' and have their address:
-            1) send FRIEND_INTRO_RESULT(can_help=True) back to requester.
-            2) send a direct FRIEND_REQUEST to 'target' on behalf of 'requester',
-               including the requester's IP/port for P2P DM.
         """
         payload = envelope.get("payload", {}) or {}
         requester = payload.get("requester")
@@ -558,12 +679,6 @@ class Middleware:
     def _handle_friend_intro_result(self, envelope: Dict[str, Any]) -> None:
         """
         Handle FRIEND_INTRO_RESULT on the requester side.
-
-        payload:
-          - requester: should be this.username
-          - target:    the user we're trying to add
-          - helper:    which friend answered
-          - can_help:  bool
         """
         payload = envelope.get("payload", {}) or {}
         requester = payload.get("requester")
@@ -592,6 +707,7 @@ class Middleware:
         # If we've heard back from everyone and no-one can help,
         # we fall back to the supernode.
         if not waiting_for and not state["got_helper"]:
+
             print(
                 f"[middleware] Intro: no online friends could introduce me to {target}, "
                 f"falling back to supernode."
@@ -635,7 +751,7 @@ class Middleware:
             if msg:
                 print(f"[middleware] {msg}")
 
-    # ---------- Direct messages ----------
+    # ---------- Direct messages + address resolution ----------
 
     def _do_send_dm(self, target: str, text: str) -> None:
         fm = self.friend_manager
@@ -644,11 +760,16 @@ class Middleware:
             print(f"[middleware] {target} is not your friend. Use /friend add {target} first.")
             return
 
-        addr = self.user_cache.get(target)
-        if not addr:
-            print(f"[middleware] No address cached for {target} yet.")
+        cached_addr = self.user_cache.get(target)
+
+        # Step 1: verify / resolve current address before sending
+        fresh_addr = self._ensure_fresh_address_for_dm(target, cached_addr)
+
+        if fresh_addr is None:
+            print(f"[middleware] Could not resolve a valid address for {target}; DM not sent.")
             return
 
+        # At this point user_cache[target] should be set to fresh_addr.
         self._send_dm_direct(target, text)
 
     def _send_dm_direct(self, target: str, text: str) -> None:
@@ -676,8 +797,401 @@ class Middleware:
 
         # Log outgoing DM in DMHistoryManager (persists to disk for this user)
         self.dm_history.log_outgoing(target, self.username, text)
+        # Notify any active DM views for this peer
+        self._notify_dm_listeners(target, self.username, text)
 
         print(f"[middleware] Sent DM to {target} at {ip}:{port}")
+
+    # Core helper: Step 1 (heartbeat identity) + Step 2 (friends/supernode resolution)
+    def _ensure_fresh_address_for_dm(
+        self,
+        target: str,
+        cached_addr: Optional[Tuple[str, int]],
+    ) -> Optional[Tuple[str, int]]:
+        """
+        Ensure that our address for `target` is still valid and belongs to `target`,
+        before sending a DM.
+
+        Returns a (ip, port) tuple if we have a fresh, verified address, else None.
+        """
+
+        # If we have a cached address, first do a heartbeat identity check.
+        stale_addr = cached_addr
+        if cached_addr is not None:
+            ok = self._verify_identity_via_heartbeat(target, cached_addr)
+            if ok:
+                # Confirmed that the current occupant of (ip,port) is indeed `target`.
+                return cached_addr
+            # Identity mismatch or timeout: treat as stale.
+            print(f"[middleware] Cached address for {target} appears stale or mismatched.")
+        else:
+            print(f"[middleware] No cached address for {target}; resolving...")
+
+        # Step 2: address resolution via friends, then supernode fallback.
+        new_addr = self._resolve_address_via_friends(target, stale_addr)
+        if new_addr is None:
+            new_addr = self._resolve_address_via_supernode(target)
+
+        if new_addr is None:
+            return None
+
+        # Final sanity: verify identity at new address as well.
+        if not self._verify_identity_via_heartbeat(target, new_addr):
+            print(f"[middleware] Identity check failed for {target} at resolved address {new_addr}.")
+            return None
+
+        # Update local cache and broadcast update to friends.
+        self.user_cache[target] = (new_addr[0], int(new_addr[1]))
+        self._broadcast_addr_update(target, new_addr[0], int(new_addr[1]), exclude={self.username})
+
+        return new_addr
+
+    # ---- Step 1: heartbeat-based identity verification ----
+
+    def _verify_identity_via_heartbeat(
+        self,
+        expected_user: str,
+        addr: Tuple[str, int],
+    ) -> bool:
+        """
+        Send a PARTNER_HEARTBEAT to `addr` and wait for an ACK.
+        If the responder's src_user matches `expected_user`, we accept it.
+        Otherwise, we treat this address as mismatched.
+
+        This runs a small local event loop and *still* dispatches any other
+        events through _handle_event, so we don't starve the rest of the system.
+        """
+        ip, port = addr
+        lamport = self.lamport.tick()
+        payload: Dict[str, Any] = {"ping": True}
+        env = make_envelope(
+            MessageType.PARTNER_HEARTBEAT,
+            self.username,
+            self.local_ip,
+            self.listen_port,
+            lamport,
+            payload,
+        )
+        self.transport.send_raw(env, (ip, port))
+
+        deadline = time.time() + self.partner_heartbeats.timeout
+        while time.time() < deadline:
+            try:
+                incoming_env, incoming_addr = self.event_queue.get(timeout=0.2)
+            except Empty:
+                continue
+            except Exception as e:
+                print(f"[middleware] Error during heartbeat wait: {e!r}")
+                continue
+
+            msg_type = incoming_env.get("type")
+            src_user = incoming_env.get("src_user")
+
+            # If it's the ACK from this address, we can make a decision.
+            if (
+                msg_type == MessageType.PARTNER_HEARTBEAT_ACK.value
+                and incoming_addr == addr
+            ):
+                # Dispatch normal handling (register_heartbeat, cache update)
+                self._handle_event(incoming_env, incoming_addr)
+                if src_user == expected_user:
+                    return True
+                # ACK from some *other* user => address has been re-used
+                print(
+                    f"[middleware] Heartbeat mismatch: expected {expected_user}, "
+                    f"but {src_user} is now at {addr[0]}:{addr[1]}"
+                )
+                return False
+
+            # Otherwise, just handle the event normally.
+            self._handle_event(incoming_env, incoming_addr)
+
+        # Timeout -> we couldn't confirm.
+        print(f"[middleware] Heartbeat timeout verifying {expected_user} at {ip}:{port}")
+        return False
+
+    # ---- Step 2a: friend-based address resolution ----
+
+    def _resolve_address_via_friends(
+        self,
+        target: str,
+        stale_addr: Optional[Tuple[str, int]],
+    ) -> Optional[Tuple[str, int]]:
+        """
+        Ask all online friends:
+          'Do you know the address for `target`?'
+
+        Returns a candidate (ip, port) if any friend reports an address
+        different from `stale_addr`; otherwise None.
+        """
+        friends = list(self.friend_manager.friends)
+        # Exclude the target themself and any friends we don't have an address for
+        online_friends = [
+            f for f in friends
+            if f != target and f in self.user_cache
+        ]
+
+        if not online_friends:
+            return None
+
+        lamport = self.lamport.tick()
+        query_payload = {
+            "requester": self.username,
+            "target": target,
+        }
+        env = make_envelope(
+            MessageType.FRIEND_ADDR_QUERY,
+            self.username,
+            self.local_ip,
+            self.listen_port,
+            lamport,
+            query_payload,
+        )
+
+        for friend in online_friends:
+            ip, port = self.user_cache[friend]
+            self.transport.send_raw(env, (ip, port))
+
+        print(
+            f"[middleware] Resolving address for {target} via friends: "
+            f"{', '.join(online_friends)}"
+        )
+
+        answers: list[Tuple[str, Tuple[str, int]]] = []
+        deadline = time.time() + self.intro_timeout_sec
+
+        while time.time() < deadline:
+            try:
+                incoming_env, incoming_addr = self.event_queue.get(timeout=0.2)
+            except Empty:
+                continue
+            except Exception as e:
+                print(f"[middleware] Error during addr query wait: {e!r}")
+                continue
+
+            msg_type = incoming_env.get("type")
+            payload = incoming_env.get("payload", {}) or {}
+            if msg_type == MessageType.FRIEND_ADDR_ANSWER.value:
+                # Only care about answers for *this* requester+target.
+                if (
+                    payload.get("requester") == self.username
+                    and payload.get("target") == target
+                ):
+                    ans_ip = payload.get("ip")
+                    ans_port = payload.get("port")
+                    helper = payload.get("helper") or incoming_env.get("src_user")
+                    if ans_ip and ans_port and helper:
+                        addr_tuple = (ans_ip, int(ans_port))
+                        answers.append((helper, addr_tuple))
+                        # We continue collecting until timeout; could early-exit if you like.
+
+            # Dispatch everything (including answers) into the normal handler.
+            self._handle_event(incoming_env, incoming_addr)
+
+        # Select any answer that is not the stale address (if stale_addr is known).
+        for helper, addr_tuple in answers:
+            if stale_addr is None or addr_tuple != stale_addr:
+                print(
+                    f"[middleware] Friend {helper} claims {target} is at "
+                    f"{addr_tuple[0]}:{addr_tuple[1]}"
+                )
+                return addr_tuple
+
+        return None
+
+    def _handle_friend_addr_query(self, envelope: Dict[str, Any], addr) -> None:
+        """
+        Handle FRIEND_ADDR_QUERY from one of our friends:
+          - If we are NOT friends with 'target' or don't have an address:
+            do nothing.
+          - If we ARE friends with 'target' and have an address:
+            reply with FRIEND_ADDR_ANSWER giving our current view.
+        """
+        payload = envelope.get("payload", {}) or {}
+        requester = payload.get("requester")
+        target = payload.get("target")
+        if not requester or not target:
+            return
+
+        # Only respond if we're friends with target *and* know their address.
+        if target not in self.friend_manager.friends:
+            return
+        addr_for_target = self.user_cache.get(target)
+        if not addr_for_target:
+            return
+
+        target_ip, target_port = addr_for_target
+        lamport = self.lamport.tick()
+        answer_payload = {
+            "requester": requester,
+            "target": target,
+            "helper": self.username,
+            "ip": target_ip,
+            "port": int(target_port),
+        }
+        answer_env = make_envelope(
+            MessageType.FRIEND_ADDR_ANSWER,
+            self.username,
+            self.local_ip,
+            self.listen_port,
+            lamport,
+            answer_payload,
+        )
+
+        requester_ip = envelope.get("src_ip")
+        requester_port = envelope.get("src_port")
+        if requester_ip and requester_port:
+            self.transport.send_raw(answer_env, (requester_ip, int(requester_port)))
+            print(
+                f"[middleware] AddrQuery: told {requester} that {target} is at "
+                f"{target_ip}:{target_port}"
+            )
+
+    # ---- Step 2b: supernode-based resolution ----
+
+    def _resolve_address_via_supernode(self, target: str) -> Optional[Tuple[str, int]]:
+        """
+        Send a LOOKUP_USER to the supernode and synchronously wait
+        for the LOOKUP_RESPONSE for `target`.
+        """
+        lamport = self.lamport.tick()
+        payload = {"target": target}
+        env = make_envelope(
+            MessageType.LOOKUP_USER,
+            self.username,
+            self.local_ip,
+            self.listen_port,
+            lamport,
+            payload,
+        )
+        self.transport.send_raw(env, self.supernode_addr)
+
+        print(f"[middleware] Resolving address for {target} via supernode...")
+
+        deadline = time.time() + self.intro_timeout_sec
+        result_addr: Optional[Tuple[str, int]] = None
+
+        while time.time() < deadline:
+            try:
+                incoming_env, incoming_addr = self.event_queue.get(timeout=0.2)
+            except Empty:
+                continue
+            except Exception as e:
+                print(f"[middleware] Error during supernode lookup wait: {e!r}")
+                continue
+
+            msg_type = incoming_env.get("type")
+            payload = incoming_env.get("payload", {}) or {}
+
+            if msg_type == MessageType.LOOKUP_RESPONSE.value:
+                user = payload.get("user")
+                if user == target:
+                    found = payload.get("found", False)
+                    if not found:
+                        self._handle_event(incoming_env, incoming_addr)
+                        print(f"[middleware] Supernode reports {target} offline/unknown.")
+                        return None
+                    ip = payload.get("ip")
+                    port = payload.get("port")
+                    if not ip or not port:
+                        self._handle_event(incoming_env, incoming_addr)
+                        print(f"[middleware] Supernode returned malformed address for {target}.")
+                        return None
+                    result_addr = (ip, int(port))
+                    # Let normal handler also update user_cache and print if needed.
+                    self._handle_event(incoming_env, incoming_addr)
+                    break
+
+            # For all other events, handle normally.
+            self._handle_event(incoming_env, incoming_addr)
+
+        if result_addr:
+            print(
+                f"[middleware] Supernode resolved {target} to "
+                f"{result_addr[0]}:{result_addr[1]}"
+            )
+        return result_addr
+
+    # ---- Address update propagation ----
+
+    def _broadcast_addr_update(
+        self,
+        user: str,
+        ip: str,
+        port: int,
+        exclude: Optional[set[str]] = None,
+    ) -> None:
+        """
+        Broadcast an address update 'user is now at ip:port' to all of *our*
+        friends, except those in `exclude` (and except `user`).
+        This is the recursive propagation we discussed.
+        """
+        exclude = set(exclude or set())
+        exclude.add(self.username)  # don't send back to ourselves
+        exclude.add(user)           # no need to notify the subject
+
+        lamport = self.lamport.tick()
+        payload = {
+            "user": user,
+            "ip": ip,
+            "port": int(port),
+            "exclude": list(exclude),
+        }
+        env = make_envelope(
+            MessageType.FRIEND_ADDR_UPDATE,
+            self.username,
+            self.local_ip,
+            self.listen_port,
+            lamport,
+            payload,
+        )
+
+        for friend in self.friend_manager.friends:
+            if friend in exclude:
+                continue
+            addr = self.user_cache.get(friend)
+            if not addr:
+                continue
+            f_ip, f_port = addr
+            self.transport.send_raw(env, (f_ip, int(f_port)))
+
+    def _handle_friend_addr_update(self, envelope: Dict[str, Any], addr) -> None:
+        """
+        Handle FRIEND_ADDR_UPDATE:
+
+        payload:
+          - user:    username whose address changed
+          - ip/port: new address
+          - exclude: usernames that must NOT be re-notified (to avoid loops)
+        """
+        payload = envelope.get("payload", {}) or {}
+        user = payload.get("user")
+        ip = payload.get("ip")
+        port = payload.get("port")
+        exclude_list = payload.get("exclude", []) or []
+
+        if not user or not ip or not port:
+            return
+
+        # Only care if we're actually friends with this user.
+        if user not in self.friend_manager.friends:
+            # We still *see* the packet but do not store or propagate it.
+            return
+
+        new_addr = (ip, int(port))
+        old_addr = self.user_cache.get(user)
+        if old_addr != new_addr:
+            self.user_cache[user] = new_addr
+            print(
+                f"[middleware] AddrUpdate: recorded {user} at {ip}:{port} "
+                f"(was {old_addr})"
+            )
+
+        # Propagate to our own friends except those in the exclude set.
+        exclude: set[str] = set(exclude_list)
+        # Add ourselves so it doesn't bounce back.
+        exclude.add(self.username)
+        self._broadcast_addr_update(user, ip, int(port), exclude=exclude)
 
     # ---------- Chunk announcement ----------
 
@@ -722,3 +1236,4 @@ class Middleware:
             return "127.0.0.1"
         finally:
             s.close()
+

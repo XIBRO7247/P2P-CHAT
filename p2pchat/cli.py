@@ -3,6 +3,7 @@
 import os
 import json
 import threading
+from queue import Empty
 import time
 from pathlib import Path
 
@@ -68,7 +69,7 @@ class CLI:
         if first_msg:
             self.middleware.send_direct_message(user, first_msg)
 
-        # Initial render
+        # Initial render from persisted history
         self._clear_screen()
         history = self.middleware.get_dm_history(user)
         self._print_dm_history(user, history)
@@ -77,10 +78,22 @@ class CLI:
         last_len = len(history)
 
         stop_event = threading.Event()
+        # Live listener (optional hint; history remains source of truth)
+        q = self.middleware.register_dm_listener(user)
 
         def ui_loop():
             nonlocal last_len
             while not stop_event.is_set():
+                # Drain listener queue (we don't print from it directly,
+                # we just use it as a hint that something changed)
+                try:
+                    while True:
+                        _ = q.get_nowait()
+                        # ignore contents; history will include it
+                except Empty:
+                    pass
+
+                # Poll history and print any new messages
                 try:
                     current = self.middleware.get_dm_history(user)
                 except Exception:
@@ -121,6 +134,7 @@ class CLI:
         finally:
             stop_event.set()
             ui_thread.join(timeout=1.0)
+            self.middleware.unregister_dm_listener(user, q)
 
     # ---------- ROOM mode (multi-threaded view) ----------
 
@@ -158,10 +172,19 @@ class CLI:
 
         last_len = len(history)
         stop_event = threading.Event()
+        q = self.middleware.register_room_listener(room_id)
 
         def ui_loop():
             nonlocal last_len
             while not stop_event.is_set():
+                # Drain listener queue (hint only)
+                try:
+                    while True:
+                        _ = q.get_nowait()
+                except Empty:
+                    pass
+
+                # Poll history
                 try:
                     current = self.middleware.get_room_history(room_id)
                 except Exception:
@@ -203,6 +226,7 @@ class CLI:
         finally:
             stop_event.set()
             ui_thread.join(timeout=1.0)
+            self.middleware.unregister_room_listener(room_id, q)
 
     # ---------- Command dispatcher (JSON-driven) ----------
 
@@ -270,13 +294,11 @@ class CLI:
 
     # ---------- Individual command handlers ----------
 
-    # /join <room>  (if you still use a top-level /join)
     def _cmd_join(self, args: list[str]) -> bool:
         room = args[0]
         self.middleware.join_room(room)
         return False
 
-    # /msg <room> <text...>  (if you still use a top-level /msg)
     def _cmd_msg(self, args: list[str]) -> bool:
         if len(args) < 2:
             print("[cli] Usage: /msg <room> <text>")
@@ -286,45 +308,38 @@ class CLI:
         self.middleware.send_room_message(room, text)
         return False
 
-    # /room msg <room> [text...]
     def _cmd_room_msg(self, args: list[str]) -> bool:
         room = args[0]
         first_msg = " ".join(args[1:]) if len(args) > 1 else None
         self._room_session(room, first_msg=first_msg)
         return False
 
-    # Optional: /room join <room> if you add it in commands.json
     def _cmd_room_join(self, args: list[str]) -> bool:
         room = args[0]
         self.middleware.join_room(room)
         print(f"[cli] Joined room {room}. Use /room msg {room} to open a chat view.")
         return False
 
-    # /friend add/request <user>
     def _cmd_friend_add(self, args: list[str]) -> bool:
         user = args[0]
         self.middleware.send_friend_request(user)
         return False
 
-    # /friend accept <user>
     def _cmd_friend_accept(self, args: list[str]) -> bool:
         user = args[0]
         self.middleware.accept_friend(user)
         return False
 
-    # /friend reject <user>
     def _cmd_friend_reject(self, args: list[str]) -> bool:
         user = args[0]
         self.middleware.reject_friend(user)
         return False
 
-    # /friend remove <user>
     def _cmd_friend_remove(self, args: list[str]) -> bool:
         user = args[0]
         self.middleware.unfriend(user)
         return False
 
-    # /friend list
     def _cmd_friend_list(self, args: list[str]) -> bool:
         fm = self.middleware.friend_manager
         friends = sorted(fm.friends)
@@ -334,7 +349,6 @@ class CLI:
             print("[cli] Friends:", ", ".join(friends))
         return False
 
-    # /friend requests
     def _cmd_friend_requests(self, args: list[str]) -> bool:
         fm = self.middleware.friend_manager
         reqs = sorted(fm.incoming_friend_requests)
@@ -344,14 +358,12 @@ class CLI:
             print("[cli] Incoming friend requests:", ", ".join(reqs))
         return False
 
-    # /dm <user> [text...]
     def _cmd_dm(self, args: list[str]) -> bool:
         user = args[0]
         first_msg = " ".join(args[1:]) if len(args) > 1 else None
         self._dm_session(user, first_msg=first_msg)
         return False
 
-    # /help
     def _cmd_help(self, args: list[str]) -> bool:
         cmds = self.command_tree.get("commands", {})
         print("Available commands:")
@@ -365,12 +377,8 @@ class CLI:
                     print("   ", sub_node.get("help", f"/{name} {sub_name} ..."))
         return False
 
-    # /exit or /quit
     def _cmd_exit(self, args: list[str]) -> bool:
-        # Returning True tells run() to break the main loop.
         return True
-
-    # ---------- Main loop ----------
 
     def run(self) -> None:
         self.middleware.start()

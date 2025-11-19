@@ -1,14 +1,19 @@
 import sys
 import json
+import traceback
+import os
 from pathlib import Path
 
 from p2pchat.cli import CLI
 from p2pchat.config_loader import Config
 
+# --------- force working directory to this file's folder ---------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(SCRIPT_DIR)
+# -----------------------------------------------------------------
 
 BASE_CONFIG_PATH = Path("config/client_config.json")
 USER_CONFIG_DIR = Path("config")
-
 
 def ensure_user_config(username: str) -> Config:
     """
@@ -65,4 +70,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        print("\n[client_main] Unhandled exception:\n")
+        traceback.print_exc()
+    finally:
+        input("\nPress Enter to close...")

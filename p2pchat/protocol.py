@@ -1,5 +1,3 @@
-# p2pchat/protocol.py
-
 import hashlib
 import json
 from enum import Enum
@@ -21,9 +19,13 @@ class MessageType(str, Enum):
     # Friend system
     FRIEND_REQUEST = "FRIEND_REQUEST"
     FRIEND_RESPONSE = "FRIEND_RESPONSE"
-    FRIEND_INTRO = "FRIEND_INTRO"   # friend-of-a-friend introduction (peer <-> peer)
+    FRIEND_INTRO = "FRIEND_INTRO"          # friend-of-a-friend introduction (peer <-> peer)
     FRIEND_INTRO_RESULT = "FRIEND_INTRO_RESULT"
 
+    # Friend address maintenance (peer <-> peer)
+    FRIEND_ADDR_QUERY = "FRIEND_ADDR_QUERY"    # "Do you know target's current address?"
+    FRIEND_ADDR_ANSWER = "FRIEND_ADDR_ANSWER"  # "Yes, here is what I think it is."
+    FRIEND_ADDR_UPDATE = "FRIEND_ADDR_UPDATE"  # "User X is now at ip:port; please update."
 
     # Data
     CHAT = "CHAT"

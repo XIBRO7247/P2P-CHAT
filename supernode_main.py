@@ -2,13 +2,18 @@
 
 import threading
 import socket
+import os
+import traceback
 from typing import Dict, Any
 
 from p2pchat.config_loader import Config
 from p2pchat.protocol import MessageType, make_envelope, parse_envelope
 from p2pchat.lamport import LamportClock
 
-
+# --------- force working directory to this file's folder ---------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(SCRIPT_DIR)
+# -----------------------------------------------------------------
 class Supernode:
     def __init__(self, host: str, port: int):
         self.host, self.port = host, port
@@ -325,13 +330,24 @@ class Supernode:
         finally:
             s.close()
 
-
-if __name__ == "__main__":
+def main() -> None:
+    print(f"[supernode] CWD is: {os.getcwd()}")
     config = Config("config/supernode_config.json")
+
     sn = Supernode(config["bind_host"], int(config["bind_port"]))
     try:
         sn.start()
+        # Block forever until killed (Ctrl+C in a real console)
         threading.Event().wait()
-    except KeyboardInterrupt:
-        print("\n[supernode] Shutting down...")
+    finally:
+        # Make sure we always stop cleanly if this function exits
         sn.stop()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        print("\n[supernode] Shutting down...")
+    finally:
+        input("\nPress Enter to close...")
