@@ -32,3 +32,24 @@ class Storage:
             raise FileNotFoundError(f"No such chunk {chunk_id} in room {room_id}")
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
+
+    def list_chunks(self, room_id: str) -> List[str]:
+        """
+        Return a list of chunk_ids we currently have for this room.
+
+        It looks for files:
+            chunks/<room_id>/<chunk_id>.json
+        and strips the `.json` suffix.
+        """
+        room_dir = self.base_path / room_id
+        if not room_dir.exists() or not room_dir.is_dir():
+            return []
+
+        chunk_ids: List[str] = []
+        for path in room_dir.glob("*.json"):
+            # e.g. "abcd1234.json" -> "abcd1234"
+            chunk_ids.append(path.stem)
+
+        # Sort for stable ordering (e.g. if chunk_ids are monotonic)
+        chunk_ids.sort()
+        return chunk_ids

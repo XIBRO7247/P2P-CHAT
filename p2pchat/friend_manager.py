@@ -11,9 +11,14 @@ class FriendManager:
     Owns friend state and persistence.
     Middleware calls methods here and then sends any returned envelopes.
 
-    This manager is agnostic to how FRIEND_REQUEST arrives:
-    - via supernode (standard case), or
-    - P2P via a mutual friend (FRIEND_INTRO path), where payload may also contain 'via'.
+    This manager is agnostic to how FRIEND_REQUEST / FRIEND_RESPONSE
+    actually travel across the network:
+    - via supernode (standard case),
+    - P2P via a mutual friend (FRIEND_INTRO path), or
+    - relayed/queued while peers are offline (same concept as DM relay).
+
+    All of that routing / retry / relay logic lives in the middleware +
+    supernode; here we just handle local state and envelopes.
     """
 
     def __init__(self, username: str, local_ip: str, listen_port: int):
@@ -40,11 +45,16 @@ class FriendManager:
         self, target: str, lamport: int
     ) -> tuple[Optional[bytes], Optional[str]]:
         """
-        Returns (env_bytes, message_str) for a FRIEND_REQUEST to send to supernode.
+        Returns (env_bytes, message_str) for a FRIEND_REQUEST to send.
 
-        This is used in:
-        - direct /friend add <user> (no online friends), or
-        - fallback path when FRIEND_INTRO timed out with no helper.
+        Middleware decides where to send it:
+        - normally: to the supernode,
+        - or via an intro/relay path (FRIEND_INTRO),
+        - or via some queued/relay mechanism if the target is offline.
+
+        From this manager's POV, we just:
+        - enforce local invariants,
+        - remember that we have an outgoing request to 'target'.
         """
         if target == self.username:
             return None, "You cannot friend yourself."
@@ -71,15 +81,14 @@ class FriendManager:
         self, user: str, lamport: int
     ) -> tuple[Optional[bytes], Optional[str]]:
         """
-        Build a FRIEND_RESPONSE(accepted=True) to send to the supernode.
+        Build a FRIEND_RESPONSE(accepted=True) envelope.
 
-        This is called whether the original FRIEND_REQUEST came via:
-        - supernode, or
-        - P2P (friend-of-a-friend relay).
+        The middleware will:
+        - send this to the supernode (for ledger + routing),
+        - optionally also send it P2P directly if it has a fresh address.
 
-        In both cases, the supernode will:
-        - log the friendship (for your “ledger”), and
-        - forward a FRIEND_RESPONSE to 'user' with this peer's IP/port.
+        However it travels, when the requester finally receives the
+        FRIEND_RESPONSE, *that's* when the friendship is considered live.
         """
         if user not in self.incoming_friend_requests:
             return None, f"No pending friend request from {user}."
@@ -108,12 +117,10 @@ class FriendManager:
         self, user: str, lamport: int
     ) -> tuple[Optional[bytes], Optional[str]]:
         """
-        Build a FRIEND_RESPONSE(accepted=False) to send to the supernode.
+        Build a FRIEND_RESPONSE(accepted=False) envelope.
 
-        Even when a request arrived P2P (via a mutual friend), this lets the
-        supernode inform the original requester that the attempt failed,
-        *without* logging a friendship edge (which matches your “only log on
-        accept” goal).
+        Again, the transport may route/relay this however it wants
+        (supernode, P2P, queued until requester is online, etc.).
         """
         if user not in self.incoming_friend_requests:
             return None, f"No pending friend request from {user}."
@@ -136,8 +143,8 @@ class FriendManager:
 
     def unfriend(self, user: str) -> str:
         """
-        Local unfriend. We don't notify supernode here; your current design
-        treats the supernode as a simple ledger of edges at creation time.
+        Local unfriend. We don't currently notify the supernode on unfriend;
+        edges are logged when created (on accept).
         """
         if user not in self.friends:
             return f"{user} is not in your friend list."
@@ -153,7 +160,7 @@ class FriendManager:
         """
         Handle incoming FRIEND_REQUEST.
 
-        Two possible sources:
+        Possible sources:
 
         1) Via supernode:
            payload = {"from_user": "<name>", "friend_ip"?, "friend_port"?}
@@ -162,7 +169,10 @@ class FriendManager:
            payload = {"from_user": "<name>", "via": "<helper_name>"}
            (no IP/port, because the packet's network origin is the helper.)
 
-        In both cases we:
+        3) Eventually: same envelopes could be delivered after being relayed /
+           queued while we were offline; that doesn't change this logic.
+
+        In all cases we:
         - add 'from_user' to incoming_friend_requests (unless already a friend),
         - store optional IP/port if present.
         """
@@ -183,16 +193,19 @@ class FriendManager:
             self.user_cache[from_user] = (ip, int(port))
             self._save()
 
-        # 'via' field (mutual friend) is purely informational; we don't need it here.
+        # 'via' field (mutual friend) is purely informational here.
         return f"New friend request from {from_user}."
 
     def on_friend_response(self, payload: Dict[str, Any]) -> tuple[bool, Optional[str]]:
         """
-        Handle incoming FRIEND_RESPONSE from supernode.
+        Handle incoming FRIEND_RESPONSE from supernode / peer.
         Returns (accepted, message_str).
 
-        This is called regardless of whether the original FRIEND_REQUEST was
-        sent directly to the supernode or relayed through a mutual friend.
+        This is called regardless of how the original FRIEND_REQUEST travelled
+        or how long it was queued/relayed:
+        - direct to supernode,
+        - via friend-of-a-friend,
+        - via some offline relay/holder mechanism.
         """
         from_user = payload.get("from_user")
         accepted = payload.get("accepted", False)
@@ -200,9 +213,11 @@ class FriendManager:
         if not from_user:
             return False, None
 
+        # We are no longer "waiting" on this user.
         self.outgoing_friend_requests.discard(from_user)
 
         if not accepted:
+            # This is a genuine user-level reject.
             return False, f"{from_user} rejected your friend request."
 
         # Accepted

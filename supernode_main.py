@@ -1,19 +1,25 @@
-# supernode_main.py
-
 import threading
 import socket
 import os
 import traceback
-from typing import Dict, Any
+import queue  # NEW
+from typing import Dict, Any, List, Tuple, Set
 
 from p2pchat.config_loader import Config
-from p2pchat.protocol import MessageType, make_envelope, parse_envelope
+from p2pchat.protocol import (
+    MessageType,
+    make_envelope,
+    parse_envelope,
+    md5_checksum,  # NEW: for integrity verification
+)
 from p2pchat.lamport import LamportClock
 
 # --------- force working directory to this file's folder ---------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(SCRIPT_DIR)
 # -----------------------------------------------------------------
+
+
 class Supernode:
     def __init__(self, host: str, port: int):
         self.host, self.port = host, port
@@ -29,8 +35,40 @@ class Supernode:
         # chunk_id -> metadata dict
         self.chunks: Dict[str, Dict[str, Any]] = {}
 
+        # Presence: username -> "ONLINE" / "OFFLINE"
+        self.user_status: Dict[str, str] = {}
+
+        # Offline DM orchestration:
+        #   for_user -> set(holder_usernames)
+        self.dm_holders: Dict[str, Set[str]] = {}
+        #   for_user -> list[{from_user, to_user, text, timestamp}]
+        # Only used as a last resort when no peer-holder is available.
+        self.dm_super_store: Dict[str, List[Dict[str, Any]]] = {}
+
+        # Offline friend orchestration (simple queues via supernode):
+        #   target_user -> set(requester_usernames)
+        # These are pending FRIEND_REQUEST edges (requester -> target).
+        self.pending_friend_requests: Dict[str, Set[str]] = {}
+        #   requester_user -> list[{from_user, accepted, friend_ip?, friend_port?}]
+        # These are pending FRIEND_RESPONSE messages destined for 'requester_user'.
+        self.pending_friend_responses: Dict[str, List[Dict[str, Any]]] = {}
+
+        # Last-resort friend events held by the supernode itself.
+        # for_user -> list[{
+        #   "kind": "request" | "response",
+        #   "from_user": str,
+        #   "accepted"?: bool,     # for responses
+        #   "timestamp": int,
+        # }]
+        self.friend_super_store: Dict[str, List[Dict[str, Any]]] = {}
+
         self._running = threading.Event()
-        self._recv_queue: list[tuple[Dict[str, Any], tuple[str, int]]] = []
+        # Thread-safe queue for received envelopes
+        self._recv_queue: "queue.Queue[tuple[Dict[str, Any], tuple[str, int]]]" = queue.Queue()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def start(self):
         self._running.set()
@@ -43,7 +81,14 @@ class Supernode:
 
     def stop(self):
         self._running.clear()
-        self.sock.close()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    # Networking loops
+    # ------------------------------------------------------------------
 
     def _recv_loop(self):
         while self._running.is_set():
@@ -53,22 +98,136 @@ class Supernode:
                 break
             try:
                 env = parse_envelope(data)
-                self._recv_queue.append((env, addr))
+                # Put into thread-safe queue
+                self._recv_queue.put((env, addr))
             except Exception:
+                # Malformed JSON etc. – just drop
                 continue
 
     def _worker_loop(self):
         while self._running.is_set():
-            if not self._recv_queue:
+            try:
+                env, addr = self._recv_queue.get(timeout=0.1)
+            except queue.Empty:
                 continue
-            env, addr = self._recv_queue.pop(0)
-            self._handle(env, addr)
+            except Exception:
+                continue
+            try:
+                self._handle(env, addr)
+            except Exception:
+                traceback.print_exc()
+
+    # ------------------------------------------------------------------
+    # Core send helper
+    # ------------------------------------------------------------------
+
+    def _send(self, data: bytes, addr) -> None:
+        """Wrapper for sending a UDP datagram with basic error handling."""
+        try:
+            self.sock.sendto(data, addr)
+        except OSError:
+            # Could log this if desired
+            pass
+
+    # ------------------------------------------------------------------
+    # Hash-error helper
+    # ------------------------------------------------------------------
+
+    def _send_hash_error(
+        self,
+        addr: Tuple[str, int],
+        src_user: str | None,
+        reason: str,
+        details: Dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Send a HASH_ERROR back to the sender when checksum validation fails.
+        """
+        payload: Dict[str, Any] = {
+            "reason": reason,
+        }
+        if src_user:
+            payload["original_src_user"] = src_user
+        if details:
+            payload["details"] = details
+
+        env = make_envelope(
+            MessageType.HASH_ERROR,
+            "supernode",
+            self.host,
+            self.port,
+            self.lamport.tick(),
+            payload,
+        )
+        self._send(env, addr)
+
+    # ------------------------------------------------------------------
+    # Top-level handler
+    # ------------------------------------------------------------------
 
     def _handle(self, env: Dict[str, Any], addr):
-        msg_type = env.get("type")
-        payload = env.get("payload", {})
-        src_user = env.get("src_user")
+        # ----- Lamport clock -----
         self.lamport.update(env.get("lamport", 0))
+
+        # ----- Integrity check for ALL incoming messages -----
+        payload = env.get("payload", {}) or {}
+        expected_checksum = env.get("checksum")
+        src_user = env.get("src_user")
+        msg_type = env.get("type")
+
+        # HASH_ERROR itself we *still* integrity-check; if its checksum is bad
+        # we just drop it silently (no point in replying with another HASH_ERROR).
+        if msg_type != MessageType.HASH_ERROR.value:
+            if expected_checksum is None:
+                # Missing checksum: treat as integrity failure.
+                print(
+                    f"[supernode] Dropping message from {src_user} at {addr}: "
+                    f"missing checksum."
+                )
+                self._send_hash_error(
+                    addr,
+                    src_user,
+                    reason="missing_checksum",
+                    details={"msg_type": msg_type},
+                )
+                return
+
+            # Recompute checksum over the payload (same scheme as make_envelope)
+            try:
+                payload_bytes = __import__("json").dumps(payload, sort_keys=True).encode("utf-8")
+                computed = md5_checksum(payload_bytes)
+            except Exception as e:
+                print(
+                    f"[supernode] Error recomputing checksum for message from "
+                    f"{src_user} at {addr}: {e!r}"
+                )
+                self._send_hash_error(
+                    addr,
+                    src_user,
+                    reason="checksum_compute_error",
+                    details={"msg_type": msg_type},
+                )
+                return
+
+            if computed != expected_checksum:
+                print(
+                    f"[supernode] Checksum mismatch from {src_user} at {addr}: "
+                    f"expected={expected_checksum}, computed={computed}. Dropping."
+                )
+                self._send_hash_error(
+                    addr,
+                    src_user,
+                    reason="checksum_mismatch",
+                    details={
+                        "msg_type": msg_type,
+                        "expected": expected_checksum,
+                        "computed": computed,
+                    },
+                )
+                return
+
+        # At this point, integrity is OK (or it's a HASH_ERROR we decided to accept).
+        msg_type = env.get("type")
 
         if msg_type == MessageType.REGISTER_USER.value:
             self._handle_register(src_user, addr, payload)
@@ -84,19 +243,39 @@ class Supernode:
             self._handle_friend_response(src_user, payload)
         elif msg_type == MessageType.LOOKUP_USER.value:
             self._handle_lookup_user(src_user, addr, payload)
+
+        # --- Presence + offline DM orchestration ---
+        elif msg_type == MessageType.USER_STATUS.value:
+            self._handle_user_status(src_user, payload)
+        elif msg_type == MessageType.PENDING_DM_HOLDER_UPDATE.value:
+            self._handle_pending_dm_holder_update(src_user, payload)
+        elif msg_type == MessageType.PENDING_DM_STORE.value:
+            self._handle_pending_dm_store(src_user, payload)
+        elif msg_type == MessageType.PENDING_DM_DELIVERED.value:
+            self._handle_pending_dm_delivered(src_user, payload)
+
+        # --- Offline friend orchestration (last-resort store) ---
+        elif msg_type == MessageType.PENDING_FRIEND_STORE.value:
+            self._handle_pending_friend_store(src_user, payload)
+        elif msg_type == MessageType.PENDING_FRIEND_DELIVERED.value:
+            self._handle_pending_friend_delivered(src_user, payload)
+
+        # --- Hash error reporting from peers ---
+        elif msg_type == MessageType.HASH_ERROR.value:
+            reason = payload.get("reason")
+            details = payload.get("details")
+            print(
+                f"[supernode] Received HASH_ERROR from {src_user} at {addr}: "
+                f"reason={reason}, details={details}"
+            )
+
         else:
             # Ignore unknown or peer-only types such as FRIEND_INTRO, etc.
             pass
 
-    def _send(self, data: bytes, addr) -> None:
-        """Wrapper for sending a UDP datagram with basic error handling."""
-        try:
-            self.sock.sendto(data, addr)
-        except OSError:
-            # Could log this if desired
-            pass
-
-    # ---------- handlers ----------
+    # ------------------------------------------------------------------
+    # Handlers
+    # ------------------------------------------------------------------
 
     def _handle_register(self, username, addr, payload):
         if not username:
@@ -107,6 +286,8 @@ class Supernode:
 
         old_endpoint = self.users.get(username)
         self.users[username] = new_endpoint
+        # A REGISTER is effectively a "I'm online here now"
+        self.user_status[username] = "ONLINE"
 
         if old_endpoint is None:
             print(f"[supernode] Registered: {username} at {addr[0]}:{listen_port}")
@@ -145,35 +326,40 @@ class Supernode:
         self._send(env, addr)
 
     def _handle_chat(self, username, payload):
+        """
+        Room chat is now P2P.
+
+        The supernode's role here is:
+        - Log the message.
+        - Optionally keep its view of room membership in sync.
+        - NOT to fan out the CHAT to other peers.
+        """
         room_id = payload.get("room_id")
         if not room_id:
             return
 
         text = payload.get("text")
         print(f"[supernode] CHAT in {room_id} from {username}: {text}")
-        members = self.rooms.get(room_id, set())
-        for member in members:
-            if member == username:
-                continue
-            dest = self.users.get(member)
-            if dest:
-                ip, port = dest
-                env = make_envelope(
-                    MessageType.CHAT,
-                    username,
-                    ip,
-                    port,
-                    self.lamport.tick(),
-                    payload,
-                )
-                self._send(env, (ip, port))
+
+        # Keep membership roughly in sync: if we see a chat from someone we
+        # don't think is in the room yet, add them.
+        members = self.rooms.setdefault(room_id, set())
+        if username not in members:
+            members.add(username)
+            print(
+                f"[supernode] (implicit) added {username} to room {room_id} "
+                f"on first CHAT"
+            )
+
+        # No broadcast here – peers already send P2P room messages.
 
     def _handle_new_chunk(self, username, payload):
         room_id = payload.get("room_id")
         chunk_id = payload.get("chunk_id")
-        if not room_id or not chunk_id:
+        if not room_id or not chunk_id or not username:
             return
 
+        # --- Store metadata locally (optional but useful) ---
         meta = {
             "room_id": room_id,
             "owner": username,
@@ -182,36 +368,101 @@ class Supernode:
         }
         self.chunks[chunk_id] = meta
         print(f"[supernode] NEW_CHUNK {chunk_id} for room {room_id} from {username}: {meta}")
-        # In a later version: choose replication targets and send REPLICATE_CHUNK_TO here.
+
+        # --- Ensure room exists ---
+        members = self.rooms.setdefault(room_id, set())
+
+        # --- Forward to all room members except the sender ---
+        for member in members:
+            if member == username:
+                continue
+
+            dest = self.users.get(member)
+            if not dest:
+                continue  # user offline or unknown
+
+            ip, port = dest
+
+            # Forward envelope with logical source = owner, network source = supernode
+            lamport = self.lamport.tick()
+            fwd_env = make_envelope(
+                MessageType.NEW_CHUNK,
+                username,  # logical source stays the real owner
+                self.host,  # network path: supernode → peer
+                self.port,
+                lamport,
+                payload
+            )
+            self._send(fwd_env, (ip, port))
 
     def _handle_friend_request(self, src_user: str, payload: Dict[str, Any]) -> None:
         """
-        Sender -> supernode -> recipient.
+        Sender -> supernode -> recipient, with offline-safe queuing.
 
         Payload from sender: {"target": "<username>"}.
         Payload to recipient: {"from_user": src_user, "friend_ip", "friend_port"}.
 
-        Note: src_user may be the *real requester* even if the datagram
-        came from a relay peer (friend-of-a-friend flow).
+        Behaviour:
+          - If target is ONLINE and known -> forward immediately.
+          - If target is OFFLINE but known -> queue request; deliver on USER_STATUS ONLINE.
+          - If target is completely unknown (never registered) -> synthetic reject
+            so the sender doesn't block forever on a typo / non-existent user.
         """
         target = payload.get("target")
-        if not target:
+        if not target or not src_user:
             return
 
-        dest = self.users.get(target)
-        if not dest:
-            print(f"[supernode] FRIEND_REQUEST from {src_user} to unknown user {target}")
+        dest_ep = self.users.get(target)
+        status = self.user_status.get(target, "OFFLINE")
+
+        # If we have never seen this username, treat as unknown and reject.
+        if dest_ep is None:
+            print(
+                f"[supernode] FRIEND_REQUEST from {src_user} to {target}, "
+                f"but target is unknown; sending synthetic reject."
+            )
+            requester_ep = self.users.get(src_user)
+            if requester_ep:
+                r_ip, r_port = requester_ep
+                resp_payload: Dict[str, Any] = {
+                    "from_user": target,
+                    "accepted": False,
+                }
+                env = make_envelope(
+                    MessageType.FRIEND_RESPONSE,
+                    "supernode",
+                    self.host,
+                    self.port,
+                    self.lamport.tick(),
+                    resp_payload,
+                )
+                self._send(env, (r_ip, r_port))
             return
 
-        # Look up the sender's endpoint so we can pass it to the recipient
+        # Known user but currently offline -> queue for later delivery.
+        if status != "ONLINE":
+            pending = self.pending_friend_requests.setdefault(target, set())
+            if src_user in pending:
+                print(
+                    f"[supernode] FRIEND_REQUEST from {src_user} to offline {target} "
+                    f"already queued; ignoring duplicate."
+                )
+            else:
+                pending.add(src_user)
+                print(
+                    f"[supernode] Queued FRIEND_REQUEST from {src_user} to offline {target}."
+                )
+            return
+
+        # Target is ONLINE -> forward immediately.
         sender_ep = self.users.get(src_user)
         if not sender_ep:
             print(f"[supernode] FRIEND_REQUEST: no endpoint for src_user {src_user}")
             return
         sender_ip, sender_port = sender_ep
 
-        ip, port = dest
-        print(f"[supernode] FRIEND_REQUEST {src_user} -> {target}")
+        ip, port = dest_ep
+        print(f"[supernode] FRIEND_REQUEST {src_user} -> {target} (immediate deliver)")
 
         forward_payload = {
             "from_user": src_user,
@@ -231,7 +482,7 @@ class Supernode:
 
     def _handle_friend_response(self, src_user: str, payload: Dict[str, Any]) -> None:
         """
-        Recipient -> supernode -> original requester.
+        Recipient -> supernode -> original requester, with offline-safe queuing.
 
         Payload from recipient: {"target": "<requester>", "accepted": bool,
                                  "friend_ip"?, "friend_port"?}.
@@ -241,15 +492,30 @@ class Supernode:
         target = payload.get("target")
         accepted = payload.get("accepted", False)
 
-        if not target:
+        if not target or not src_user:
             return
 
-        dest = self.users.get(target)
-        if not dest:
-            print(f"[supernode] FRIEND_RESPONSE from {src_user} to unknown user {target}")
+        dest_ep = self.users.get(target)
+        status = self.user_status.get(target, "OFFLINE")
+
+        # If requester is offline or unknown -> queue response for later.
+        if dest_ep is None or status != "ONLINE":
+            bucket = self.pending_friend_responses.setdefault(target, [])
+            bucket.append(
+                {
+                    "from_user": src_user,
+                    "accepted": bool(accepted),
+                    "friend_ip": payload.get("friend_ip"),
+                    "friend_port": payload.get("friend_port"),
+                }
+            )
+            print(
+                f"[supernode] Queued FRIEND_RESPONSE from {src_user} to offline/unknown "
+                f"{target}, accepted={accepted}."
+            )
             return
 
-        ip, port = dest
+        ip, port = dest_ep
         forward_payload: Dict[str, Any] = {
             "from_user": src_user,
             "accepted": bool(accepted),
@@ -263,7 +529,7 @@ class Supernode:
                 forward_payload["friend_ip"] = friend_ip
                 forward_payload["friend_port"] = friend_port
 
-        print(f"[supernode] FRIEND_RESPONSE {src_user} -> {target}, accepted={accepted}")
+        print(f"[supernode] FRIEND_RESPONSE {src_user} -> {target}, accepted={accepted} (immediate deliver)")
 
         env = make_envelope(
             MessageType.FRIEND_RESPONSE,
@@ -282,13 +548,19 @@ class Supernode:
         Payload from client: {"target": "<username>"}
         Response payload:    {"user": "<username>", "found": bool,
                               "ip"?, "port"?}
+
+        Presence-aware: if we know the user but they are not ONLINE,
+        we report found=False so peers can treat them as offline and
+        queue/forward DMs instead of trying heartbeat.
         """
         target = payload.get("target")
         if not target:
             return
 
         ep = self.users.get(target)
-        if ep is None:
+        status = self.user_status.get(target, "OFFLINE")
+
+        if ep is None or status != "ONLINE":
             print(f"[supernode] LOOKUP_USER from {src_user}: {target} not found/online")
             resp_payload = {
                 "user": target,
@@ -314,6 +586,349 @@ class Supernode:
         )
         self._send(env, addr)
 
+    # ------------------------------------------------------------------
+    # Presence + offline DM + offline friend orchestration
+    # ------------------------------------------------------------------
+
+    def _handle_user_status(self, src_user: str, payload: Dict[str, Any]) -> None:
+        if not src_user:
+            return
+        status = payload.get("status")
+        if not status:
+            return
+
+        self.user_status[src_user] = status
+        print(f"[supernode] USER_STATUS {src_user} -> {status}")
+
+        if status == "ONLINE":
+            # --- DM holders / supernode-held DMs ---
+
+            # 1) If src_user is a DM recipient, tell all known holders to deliver.
+            holders = self.dm_holders.get(src_user, set())
+            for holder in list(holders):
+                self._send_dm_deliver_request(holder, src_user)
+
+            # 2) If src_user is a holder, and there are recipients they hold
+            #    messages for who are already ONLINE, tell them to deliver too.
+            for for_user, holder_set in self.dm_holders.items():
+                if src_user in holder_set and self.user_status.get(for_user) == "ONLINE":
+                    self._send_dm_deliver_request(src_user, for_user)
+
+            # 3) If supernode is holding DMs for src_user as last resort, deliver now.
+            stored = self.dm_super_store.get(src_user) or []
+            if stored and self.users.get(src_user):
+                print(
+                    f"[supernode] Delivering {len(stored)} supernode-held "
+                    f"pending DM(s) to {src_user}."
+                )
+                for msg in stored:
+                    from_user = msg.get("from_user")
+                    text = msg.get("text")
+                    ts = msg.get("timestamp")
+                    if not from_user or text is None:
+                        continue
+                    self._send_dm_direct_from_supernode(from_user, src_user, text, ts)
+                # After delivery, clear store for this user.
+                self.dm_super_store.pop(src_user, None)
+
+            # --- Offline friend events stored on supernode as last resort ---
+
+            friend_events = self.friend_super_store.get(src_user) or []
+            if friend_events and self.users.get(src_user):
+                dest_ip, dest_port = self.users[src_user]
+                print(
+                    f"[supernode] Delivering {len(friend_events)} supernode-held "
+                    f"pending friend event(s) to {src_user}."
+                )
+                for ev in friend_events:
+                    kind = ev.get("kind")
+                    from_user = ev.get("from_user")
+                    if not kind or not from_user:
+                        continue
+
+                    if kind == "request":
+                        # Replay as FRIEND_REQUEST from from_user -> src_user
+                        fwd_payload: Dict[str, Any] = {
+                            "from_user": from_user,
+                        }
+                        # If we know from_user's endpoint and they are online,
+                        # include friend_ip/port (nice-to-have, not required).
+                        from_ep = self.users.get(from_user)
+                        if from_ep and self.user_status.get(from_user) == "ONLINE":
+                            f_ip, f_port = from_ep
+                            fwd_payload["friend_ip"] = f_ip
+                            fwd_payload["friend_port"] = f_port
+
+                        env = make_envelope(
+                            MessageType.FRIEND_REQUEST,
+                            from_user,   # logical source is original requester
+                            self.host,   # network source is supernode
+                            self.port,
+                            self.lamport.tick(),
+                            fwd_payload,
+                        )
+                        self._send(env, (dest_ip, dest_port))
+
+                    elif kind == "response":
+                        accepted = bool(ev.get("accepted", False))
+                        fwd_payload = {
+                            "from_user": from_user,
+                            "accepted": accepted,
+                        }
+                        # If accepted and we know from_user's endpoint, forward address too.
+                        from_ep = self.users.get(from_user)
+                        if accepted and from_ep and self.user_status.get(from_user) == "ONLINE":
+                            f_ip, f_port = from_ep
+                            fwd_payload["friend_ip"] = f_ip
+                            fwd_payload["friend_port"] = f_port
+
+                        env = make_envelope(
+                            MessageType.FRIEND_RESPONSE,
+                            from_user,   # logical source
+                            self.host,
+                            self.port,
+                            self.lamport.tick(),
+                            fwd_payload,
+                        )
+                        self._send(env, (dest_ip, dest_port))
+
+                # Clear after replay
+                self.friend_super_store.pop(src_user, None)
+
+            # --- Offline friend requests queued for this user as TARGET ---
+
+            pending_reqs = self.pending_friend_requests.pop(src_user, set())
+            if pending_reqs:
+                dest_ep = self.users.get(src_user)
+                if dest_ep:
+                    ip, port = dest_ep
+                    for requester in sorted(pending_reqs):
+                        requester_ep = self.users.get(requester)
+                        if requester_ep:
+                            r_ip, r_port = requester_ep
+                            fwd_payload = {
+                                "from_user": requester,
+                                "friend_ip": r_ip,
+                                "friend_port": r_port,
+                            }
+                        else:
+                            # Requester currently offline/unknown → still deliver logical request
+                            fwd_payload = {
+                                "from_user": requester,
+                            }
+
+                        env = make_envelope(
+                            MessageType.FRIEND_REQUEST,
+                            requester,      # logical source
+                            self.host,      # network source is supernode
+                            self.port,
+                            self.lamport.tick(),
+                            fwd_payload,
+                        )
+                        self._send(env, (ip, port))
+                        print(
+                            f"[supernode] Delivered queued FRIEND_REQUEST from {requester} "
+                            f"to {src_user} on ONLINE."
+                        )
+
+            # --- Offline friend responses queued for this user as REQUESTER ---
+
+            pending_resps = self.pending_friend_responses.pop(src_user, [])
+            if pending_resps:
+                dest_ep = self.users.get(src_user)
+                if dest_ep:
+                    ip, port = dest_ep
+                    for msg in pending_resps:
+                        from_user = msg.get("from_user")
+                        accepted = bool(msg.get("accepted", False))
+                        friend_ip = msg.get("friend_ip")
+                        friend_port = msg.get("friend_port")
+
+                        fwd_payload: Dict[str, Any] = {
+                            "from_user": from_user,
+                            "accepted": accepted,
+                        }
+                        if accepted and friend_ip and friend_port:
+                            fwd_payload["friend_ip"] = friend_ip
+                            fwd_payload["friend_port"] = friend_port
+
+                        env = make_envelope(
+                            MessageType.FRIEND_RESPONSE,
+                            from_user,      # logical source
+                            self.host,      # network source is supernode
+                            self.port,
+                            self.lamport.tick(),
+                            fwd_payload,
+                        )
+                        self._send(env, (ip, port))
+                        print(
+                            f"[supernode] Delivered queued FRIEND_RESPONSE from {from_user} "
+                            f"to {src_user} on ONLINE, accepted={accepted}."
+                        )
+
+        elif status == "OFFLINE":
+            # Marked offline; LOOKUP_USER will now say "found=False" for them.
+            pass
+
+    def _send_dm_deliver_request(self, holder: str, for_user: str) -> None:
+        holder_ep = self.users.get(holder)
+        if not holder_ep:
+            return
+        ip, port = holder_ep
+        payload = {"for_user": for_user}
+        env = make_envelope(
+            MessageType.PENDING_DM_DELIVER_REQUEST,
+            "supernode",
+            self.host,
+            self.port,
+            self.lamport.tick(),
+            payload,
+        )
+        self._send(env, (ip, port))
+        print(f"[supernode] Asked holder {holder} to deliver pending DM(s) for {for_user}.")
+
+    def _handle_pending_dm_holder_update(self, src_user: str, payload: Dict[str, Any]) -> None:
+        """
+        Record that 'holder' is now holding pending DMs for 'for_user'.
+
+        Payload: {"for_user": "<username>", "holder": "<username>"}
+        """
+        for_user = payload.get("for_user")
+        holder = payload.get("holder")
+        if not for_user or not holder:
+            return
+
+        holders = self.dm_holders.setdefault(for_user, set())
+        holders.add(holder)
+        print(f"[supernode] Holder update: {holder} now holds pending DM(s) for {for_user}.")
+
+    def _handle_pending_dm_store(self, src_user: str, payload: Dict[str, Any]) -> None:
+        """
+        Last-resort storage of pending DMs on the supernode itself.
+
+        Payload: {"for_user": "<username>", "messages": [ {from_user, to_user, text, timestamp}, ... ]}
+        """
+        target = payload.get("for_user")
+        msgs = payload.get("messages") or []
+        if not target or not msgs:
+            return
+
+        bucket = self.dm_super_store.setdefault(target, [])
+        bucket.extend(msgs)
+        print(
+            f"[supernode] Stored {len(msgs)} pending DM(s) for {target} as last-resort holder "
+            f"(from {src_user})."
+        )
+
+    def _handle_pending_dm_delivered(self, src_user: str, payload: Dict[str, Any]) -> None:
+        """
+        A holder reports that it has delivered pending DMs.
+
+        Payload: {"for_user": "<username>", "count": int}
+        """
+        for_user = payload.get("for_user")
+        count = int(payload.get("count", 0))
+        if not for_user:
+            return
+
+        print(
+            f"[supernode] Holder {src_user} reports delivery of {count} pending DM(s) "
+            f"to {for_user}."
+        )
+
+        # In this design, there's only ever one holder per user at a time,
+        # so if we see a non-zero count we can safely clear holder metadata.
+        if count > 0:
+            self.dm_holders.pop(for_user, None)
+            # Supernode store for that user should now be irrelevant as well.
+            self.dm_super_store.pop(for_user, None)
+
+    def _send_dm_direct_from_supernode(
+        self,
+        from_user: str,
+        to_user: str,
+        text: str,
+        timestamp: int,
+    ) -> None:
+        """
+        Deliver a DM held by the supernode directly to 'to_user' as if it came
+        from 'from_user'. Only used for last-resort stored messages.
+        """
+        dest_ep = self.users.get(to_user)
+        if not dest_ep:
+            print(
+                f"[supernode] Cannot deliver supernode-held DM from {from_user} to {to_user}: "
+                f"user has no endpoint."
+            )
+            return
+
+        ip, port = dest_ep
+        payload = {
+            "dm": True,
+            "target": to_user,
+            "text": text,
+            "timestamp": timestamp,
+        }
+        env = make_envelope(
+            MessageType.CHAT,
+            from_user,       # logical sender is original user
+            self.host,       # network source is supernode
+            self.port,
+            self.lamport.tick(),
+            payload,
+        )
+        self._send(env, (ip, port))
+        print(
+            f"[supernode] Delivered supernode-held DM from {from_user} to {to_user} "
+            f"at {ip}:{port}."
+        )
+
+    # ---------- Pending friend last-resort handlers ----------
+
+    def _handle_pending_friend_store(self, src_user: str, payload: Dict[str, Any]) -> None:
+        """
+        Last-resort storage of pending friend events on the supernode.
+
+        Payload: {"for_user": "<username>",
+                  "events": [ {kind, from_user, accepted?, timestamp}, ... ]}
+        """
+        target = payload.get("for_user")
+        events = payload.get("events") or []
+        if not target or not events:
+            return
+
+        bucket = self.friend_super_store.setdefault(target, [])
+        bucket.extend(events)
+        print(
+            f"[supernode] Stored {len(events)} pending friend event(s) for {target} "
+            f"as last-resort holder (from {src_user})."
+        )
+
+    def _handle_pending_friend_delivered(self, src_user: str, payload: Dict[str, Any]) -> None:
+        """
+        A holder reports that it has delivered pending friend events.
+
+        Payload: {"for_user": "<username>", "count": int}
+        """
+        for_user = payload.get("for_user")
+        count = int(payload.get("count", 0))
+        if not for_user:
+            return
+
+        print(
+            f"[supernode] Holder {src_user} reports delivery of {count} pending "
+            f"friend event(s) to {for_user}."
+        )
+
+        if count > 0:
+            # If a holder has delivered events, any last-resort copy we hold
+            # for that user is now stale.
+            self.friend_super_store.pop(for_user, None)
+
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _guess_lan_ip() -> str:
         """
@@ -329,6 +944,7 @@ class Supernode:
             return "127.0.0.1"
         finally:
             s.close()
+
 
 def main() -> None:
     print(f"[supernode] CWD is: {os.getcwd()}")
@@ -349,5 +965,6 @@ if __name__ == "__main__":
         main()
     except Exception:
         print("\n[supernode] Shutting down...")
+        traceback.print_exc()
     finally:
         input("\nPress Enter to close...")
