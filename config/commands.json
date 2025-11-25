@@ -12,8 +12,18 @@
           "handler": "self._cmd_room_join",
           "help": "/room join <room> - join or create a room (no dedicated view)",
           "min_args": 1
+        },
+        "list": {
+          "handler": "self._cmd_room_list",
+          "help": "/room list - show rooms you have joined and all known rooms",
+          "min_args": 0
         }
       }
+    },
+    "rooms": {
+      "handler": "self._cmd_room_list",
+      "help": "/rooms - show rooms you have joined and all known rooms (alias of /room list)",
+      "min_args": 0
     },
     "friend": {
       "help": "/friend ... - manage friends",

@@ -1,3 +1,4 @@
+import json
 import socket
 import threading
 import errno
@@ -52,7 +53,9 @@ class UDPTransport:
             except Exception:
                 continue
 
-    def send_raw(self, data: bytes, addr: Tuple[str, int]) -> None:
+    def send_raw(self, data: any, addr: Tuple[str, int]) -> None:
+        if isinstance(data, dict):
+            data = json.dumps(data).encode('utf-8')
         try:
             self.sock.sendto(data, addr)
         except Exception:

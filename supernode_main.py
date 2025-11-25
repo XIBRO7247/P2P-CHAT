@@ -2,7 +2,8 @@ import threading
 import socket
 import os
 import traceback
-import queue  # NEW
+import queue
+import json
 from typing import Dict, Any, List, Tuple, Set
 
 from p2pchat.config_loader import Config
@@ -10,7 +11,7 @@ from p2pchat.protocol import (
     MessageType,
     make_envelope,
     parse_envelope,
-    md5_checksum,  # NEW: for integrity verification
+    md5_checksum,
 )
 from p2pchat.lamport import LamportClock
 
@@ -121,9 +122,15 @@ class Supernode:
     # Core send helper
     # ------------------------------------------------------------------
 
-    def _send(self, data: bytes, addr) -> None:
-        """Wrapper for sending a UDP datagram with basic error handling."""
+    def _send(self, env: Dict[str, Any], addr) -> None:
+        """
+        Wrapper for sending a UDP datagram with basic error handling.
+
+        'env' is a logical envelope dict as produced by make_envelope().
+        We serialise it to JSON bytes here.
+        """
         try:
+            data = json.dumps(env).encode("utf-8")
             self.sock.sendto(data, addr)
         except OSError:
             # Could log this if desired
@@ -174,6 +181,7 @@ class Supernode:
         expected_checksum = env.get("checksum")
         src_user = env.get("src_user")
         msg_type = env.get("type")
+        msg_id = env.get("msg_id")
 
         # HASH_ERROR itself we *still* integrity-check; if its checksum is bad
         # we just drop it silently (no point in replying with another HASH_ERROR).
@@ -188,13 +196,13 @@ class Supernode:
                     addr,
                     src_user,
                     reason="missing_checksum",
-                    details={"msg_type": msg_type},
+                    details={"msg_type": msg_type, "msg_id": msg_id},
                 )
                 return
 
             # Recompute checksum over the payload (same scheme as make_envelope)
             try:
-                payload_bytes = __import__("json").dumps(payload, sort_keys=True).encode("utf-8")
+                payload_bytes = json.dumps(payload, sort_keys=True).encode("utf-8")
                 computed = md5_checksum(payload_bytes)
             except Exception as e:
                 print(
@@ -205,7 +213,7 @@ class Supernode:
                     addr,
                     src_user,
                     reason="checksum_compute_error",
-                    details={"msg_type": msg_type},
+                    details={"msg_type": msg_type, "msg_id": msg_id},
                 )
                 return
 
@@ -220,6 +228,7 @@ class Supernode:
                     reason="checksum_mismatch",
                     details={
                         "msg_type": msg_type,
+                        "msg_id": msg_id,
                         "expected": expected_checksum,
                         "computed": computed,
                     },
@@ -233,6 +242,10 @@ class Supernode:
             self._handle_register(src_user, addr, payload)
         elif msg_type == MessageType.JOIN_ROOM.value:
             self._handle_join_room(src_user, addr, payload)
+        elif msg_type == MessageType.LEAVE_ROOM.value:
+            self._handle_leave_room(src_user, addr, payload)
+        elif msg_type == MessageType.LIST_ROOMS.value:
+            self._handle_list_rooms(src_user, addr, payload)
         elif msg_type == MessageType.CHAT.value:
             self._handle_chat(src_user, payload)
         elif msg_type == MessageType.NEW_CHUNK.value:
@@ -270,7 +283,7 @@ class Supernode:
             )
 
         else:
-            # Ignore unknown or peer-only types such as FRIEND_INTRO, etc.
+            # Ignore unknown or peer-only types such as FRIEND_INTRO, heartbeats, etc.
             pass
 
     # ------------------------------------------------------------------
@@ -322,6 +335,64 @@ class Supernode:
             self.port,
             self.lamport.tick(),
             {"room_id": room_id, "members": list(members)},
+        )
+        self._send(env, addr)
+
+    def _handle_leave_room(self, username: str | None, addr, payload: Dict[str, Any]) -> None:
+        """
+        Handle LEAVE_ROOM from a client: remove them from the room set, if present.
+        No ACK needed; the operation is idempotent.
+        """
+        if not username:
+            return
+        room_id = payload.get("room_id")
+        if not room_id:
+            return
+
+        members = self.rooms.get(room_id)
+        if members and username in members:
+            members.discard(username)
+            print(f"[supernode] {username} left room {room_id}")
+        else:
+            print(f"[supernode] LEAVE_ROOM from {username} for {room_id}, but they were not a member.")
+
+
+    def _handle_list_rooms(self, username: str | None, addr, payload: Dict[str, Any]) -> None:
+        """
+        Handle LIST_ROOMS from a client.
+
+        Response payload:
+            {
+                "joined":   [room_id, ...],   # rooms where 'username' is a member
+                "available":[room_id, ...],   # all known rooms (discovery)
+            }
+        """
+        if not username:
+            return
+
+        joined = sorted(
+            [rid for rid, members in self.rooms.items() if username in members]
+        )
+        available = sorted(list(self.rooms.keys()))
+
+        print(
+            f"[supernode] LIST_ROOMS from {username}: "
+            f"joined={joined}, available={available}"
+        )
+
+        resp_payload = {
+            "user": username,
+            "joined": joined,
+            "available": available,
+        }
+
+        env = make_envelope(
+            MessageType.LIST_ROOMS_RESPONSE,
+            "supernode",
+            self.host,
+            self.port,
+            self.lamport.tick(),
+            resp_payload,
         )
         self._send(env, addr)
 
@@ -391,7 +462,7 @@ class Supernode:
                 self.host,  # network path: supernode → peer
                 self.port,
                 lamport,
-                payload
+                payload,
             )
             self._send(fwd_env, (ip, port))
 

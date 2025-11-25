@@ -12,6 +12,7 @@ from .middleware import Middleware
 
 class CLI:
     """Simple command-line interface for interacting with middleware."""
+
     def __init__(self, username: str, config):
         self.middleware = Middleware(username, config)
 
@@ -49,6 +50,7 @@ class CLI:
         if not history:
             print("(no messages yet)")
         else:
+            # history expected as list[(sender, text)]
             for sender, text in history:
                 label = "me" if sender == self.middleware.username else sender
                 print(f"[{label}] {text}")
@@ -162,6 +164,7 @@ class CLI:
         if not history:
             print("(no messages yet)")
         else:
+            # history expected as list[(sender, text)]
             for sender, text in history:
                 label = "me" if sender == self.middleware.username else sender
                 print(f"[{label}] {text}")
@@ -319,6 +322,49 @@ class CLI:
         self.middleware.join_room(room)
         print(f"[cli] Joined room {room}. Use /room msg {room} to open a chat view.")
         return False
+
+    def _cmd_room_list(self, args: list[str]) -> bool:
+        """
+        List rooms via middleware.list_rooms().
+
+        Expected middleware return:
+          - either a dict {"joined": [...], "available": [...]}
+          - or a tuple (joined, available)
+        """
+        try:
+            info = self.middleware.list_rooms()
+        except AttributeError:
+            print("[cli] Room listing is not supported by this middleware version.")
+            return False
+
+        if isinstance(info, dict):
+            joined = sorted(info.get("joined", []))
+            available = sorted(info.get("available", []))
+        else:
+            # Assume tuple-like
+            joined, available = info
+            joined = sorted(joined or [])
+            available = sorted(available or [])
+
+        print("[cli] Rooms you have joined:")
+        if not joined:
+            print("  (none)")
+        else:
+            for r in joined:
+                print(f"  - {r}")
+
+        print("[cli] All known rooms:")
+        if not available:
+            print("  (none)")
+        else:
+            for r in available:
+                print(f"  - {r}")
+
+        return False
+
+    # alias so commands.json can point to either handler name
+    def _cmd_rooms(self, args: list[str]) -> bool:
+        return self._cmd_room_list(args)
 
     def _cmd_friend_add(self, args: list[str]) -> bool:
         user = args[0]

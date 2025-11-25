@@ -121,6 +121,8 @@ class Middleware:
         self._retransmit_lock = threading.Lock()
         self._retransmit_ttl = float(config.get("retransmit_ttl_sec", 10.0))
         self._retransmit_max_attempts = int(config.get("retransmit_max_attempts", 3))
+        self._retransmit_interval = float(config.get("retransmit_interval_sec", 0.5))
+
 
     # ---------- Lifecycle ----------
 
@@ -163,6 +165,7 @@ class Middleware:
             "addr": addr,
             "timestamp": time.time(),
             "attempts": 0,
+            "type": env.get("type"),
         }
 
         with self._retransmit_lock:
@@ -183,6 +186,45 @@ class Middleware:
         self.transport.send_raw(env, addr)
         if track:
             self._register_retransmit(env, addr)
+
+    def _check_retransmissions(self) -> None:
+        """
+        Periodically resend un-ACKed DM messages until attempts/max/TTL.
+        Only applies to CHAT DMs we explicitly track.
+        """
+        now = time.time()
+        to_resend: list[Tuple[str, Dict[str, Any]]] = []
+
+        with self._retransmit_lock:
+            for msg_id, entry in self._retransmit_buffer.items():
+                if entry.get("type") != MessageType.CHAT.value:
+                    continue
+                age = now - entry.get("timestamp", now)
+                attempts = entry.get("attempts", 0)
+                if (
+                    age >= self._retransmit_interval
+                    and attempts < self._retransmit_max_attempts
+                ):
+                    entry["attempts"] = attempts + 1
+                    entry["timestamp"] = now
+                    to_resend.append((msg_id, entry))
+
+        for msg_id, entry in to_resend:
+            env_to_resend = entry.get("envelope")
+            dest = entry.get("addr")
+            if not env_to_resend or not dest:
+                continue
+            try:
+                # Do NOT re-register; we already track attempts.
+                self.transport.send_raw(env_to_resend, dest)
+                self._debug(
+                    f"[middleware] Retransmitted DM msg_id={msg_id} to {dest} "
+                    f"(attempt {entry['attempts']})"
+                )
+            except Exception as e:
+                self._debug(
+                    f"[middleware] Error retransmitting DM msg_id {msg_id} to {dest}: {e!r}"
+                )
 
     def _cleanup_retransmit_buffer(self) -> None:
         """
@@ -242,11 +284,59 @@ class Middleware:
     def join_room(self, room_id: str) -> None:
         self._enqueue(("join_room", {"room_id": room_id}))
 
+    def leave_room(self, room_id: str) -> None:
+        """Ask supernode to remove us from a room and update local state."""
+        self._enqueue(("leave_room", {"room_id": room_id}))
+
     def send_room_message(self, room_id: str, text: str) -> None:
         self._enqueue(("send_room_msg", {"room_id": room_id, "text": text}))
 
     def lookup_user(self, target: str) -> None:
         self._enqueue(("lookup_user", {"target": target}))
+
+    def list_rooms(self) -> Dict[str, list[str]]:
+        """
+        Return a snapshot of rooms known locally or via the supernode.
+        """
+        response_q: Queue = Queue()
+        # Ask worker to do the LIST_ROOMS round-trip
+        self._enqueue(("list_rooms", {"response_q": response_q}))
+
+        try:
+            # Wait for the worker to put the merged result in the queue
+            return response_q.get(timeout=self.intro_timeout_sec)
+        except Empty:
+            # If something goes wrong, fall back to the local snapshot
+            return self._local_room_snapshot()
+
+    def _local_room_snapshot(self) -> Dict[str, list[str]]:
+        """
+        Local-only view of rooms, used as a fallback if the supernode does not
+        respond to LIST_ROOMS in time.
+
+        - "joined": rooms where this user is currently a member (RoomManager view)
+        - "available": union of any rooms we know about locally (RoomManager + history)
+        """
+        # Rooms tracked by RoomManager
+        room_members = getattr(self.room_manager, "room_members", {})
+        joined = sorted(
+            room_id
+            for room_id, members in room_members.items()
+            if isinstance(members, set) and self.username in members
+        )
+
+        known_from_members = set(room_members.keys())
+
+        # Optionally include rooms that only exist in history
+        history_rooms: Set[str] = set()
+        try:
+            if hasattr(self.room_history, "list_rooms"):
+                history_rooms = set(self.room_history.list_rooms())
+        except Exception:
+            history_rooms = set()
+
+        available = sorted(known_from_members | history_rooms | set(joined))
+        return {"joined": joined, "available": available}
 
     # Friend system
     def send_friend_request(self, target: str) -> None:
@@ -274,9 +364,23 @@ class Middleware:
         return self.dm_history.get_history(peer)
 
     # Room history (for /room msg sessions)
+    # Room history (for /room msg sessions)
     def get_room_history(self, room_id: str):
         """Used by the CLI to render room conversation view."""
         return self.room_history.get_history(room_id)
+
+    def get_room_members(self, room_id: str) -> list[str]:
+        """
+        Return our current view of members in a room (from RoomManager).
+
+        This is eventually consistent: JOIN_ROOM_ACK and observed CHAT messages
+        keep it up to date.
+        """
+        try:
+            members = self.room_manager.get_peers_in_room(room_id)
+        except Exception:
+            members = set()
+        return sorted(m for m in members if isinstance(m, str))
 
     # ---------- Listener registration (for CLI live views) ----------
 
@@ -373,6 +477,8 @@ class Middleware:
             self._check_intro_timeouts()
             # Prune old retransmit entries
             self._cleanup_retransmit_buffer()
+            # Retransmit un-ACKed DMs if needed
+            self._check_retransmissions()
 
     def _handle_command(self, cmd) -> None:
         name, args = cmd
@@ -380,8 +486,14 @@ class Middleware:
             self._do_register()
         elif name == "join_room":
             self._do_join_room(args["room_id"])
+        elif name == "leave_room":
+            self._do_leave_room(args["room_id"])
         elif name == "send_room_msg":
             self._do_send_room_msg(args["room_id"], args["text"])
+        elif name == "list_rooms":
+            # Synchronous LIST_ROOMS via supernode, result posted back to the
+            # caller thread via the provided Queue.
+            self._do_list_rooms(args["response_q"])
         elif name == "lookup_user":
             self._do_lookup_user(args["target"])
         elif name == "friend_request":
@@ -482,6 +594,12 @@ class Middleware:
             print(f"[middleware] Joined room {room_id}, members = {members}")
             self._on_join_room_ack(room_id, members)
 
+        elif msg_type == MessageType.LIST_ROOMS_RESPONSE.value:
+            # Typically consumed by _do_list_rooms; if it reaches here,
+            # we just update Lamport via the generic path and ignore.
+            self._debug(f"[middleware] Unhandled LIST_ROOMS_RESPONSE {payload}.")
+
+
         elif msg_type == MessageType.FRIEND_REQUEST.value:
             msg = self.friend_manager.on_friend_request(payload)
             if msg:
@@ -534,6 +652,21 @@ class Middleware:
                         self._notify_dm_listeners(peer, src_user, text)
                     except Exception as e:
                         print(f"[middleware] Error logging DM from {src_user}: {e!r}")
+                    # Send ACK for this DM (so sender can stop retransmitting)
+                    original_msg_id = envelope.get("msg_id")
+                    if original_msg_id:
+                        ack_payload = {"msg_id": original_msg_id}
+                        ack_env = make_envelope(
+                            MessageType.MESSAGE_ACK,
+                            self.username,
+                            self.local_ip,
+                            self.listen_port,
+                            self.lamport.tick(),
+                            ack_payload,
+                        )
+                        # ACKs are small control messages; don't track.
+                        self._send_envelope(ack_env, addr, track=False)
+
             else:
                 if room_id and src_user and text is not None:
                     # Track active speakers as room members
@@ -542,6 +675,9 @@ class Middleware:
                     self._notify_room_listeners(room_id, src_user, text)
                     # Always show actual chat lines
                     print(f"[{room_id}] <{src_user}> {text}")
+
+        elif msg_type == MessageType.MESSAGE_ACK.value:
+            self._handle_message_ack(envelope, addr)
 
         elif msg_type == MessageType.NEW_CHUNK.value:
             # NEW_CHUNK now drives replication tracking and optional replication.
@@ -781,6 +917,118 @@ class Middleware:
         )
         self._send_envelope(data, self.supernode_addr)
 
+    def _do_leave_room(self, room_id: str) -> None:
+        """
+        Leave a room:
+
+        - Tell supernode we are leaving.
+        - Update our local RoomManager view.
+        """
+        # Update local membership immediately
+        try:
+            if hasattr(self.room_manager, "remove_peer_from_room"):
+                self.room_manager.remove_peer_from_room(room_id, self.username)
+        except Exception as e:
+            self._debug(f"[middleware] Error updating local room state on leave: {e!r}")
+
+        lamport = self.lamport.tick()
+        payload = {"room_id": room_id}
+        env = make_envelope(
+            MessageType.LEAVE_ROOM,
+            self.username,
+            self.local_ip,
+            self.listen_port,
+            lamport,
+            payload,
+        )
+        # No need to track or ACK leave messages
+        self._send_envelope(env, self.supernode_addr, track=False)
+        self._debug(f"[middleware] Sent LEAVE_ROOM for {room_id} to supernode.")
+
+
+    def _do_list_rooms(self, response_q: Queue) -> None:
+        """
+        Worker-side implementation of LIST_ROOMS.
+
+        - Sends LIST_ROOMS to the supernode.
+        - Waits synchronously on event_queue for a LIST_ROOMS_RESPONSE.
+        - Merges remote data with local snapshot.
+        - Puts {"joined": [...], "available": [...]} into response_q.
+        """
+        timeout = self.intro_timeout_sec
+        lamport = self.lamport.tick()
+        payload = {
+            "user": self.username,
+        }
+        env = make_envelope(
+            MessageType.LIST_ROOMS,
+            self.username,
+            self.local_ip,
+            self.listen_port,
+            lamport,
+            payload,
+        )
+
+        try:
+            self._send_envelope(env, self.supernode_addr)
+            self._debug("[middleware] Sent LIST_ROOMS request to supernode.")
+        except Exception as e:
+            self._debug(f"[middleware] Error sending LIST_ROOMS to supernode: {e!r}")
+            response_q.put(self._local_room_snapshot())
+            return
+
+        deadline = time.time() + timeout
+        rooms_result: Optional[Dict[str, list[str]]] = None
+
+        while time.time() < deadline:
+            try:
+                incoming_env, incoming_addr = self.event_queue.get(timeout=0.2)
+            except Empty:
+                continue
+            except Exception as e:
+                self._debug(f"[middleware] Error during LIST_ROOMS wait: {e!r}")
+                continue
+
+            msg_type = incoming_env.get("type")
+            payload2 = incoming_env.get("payload", {}) or {}
+
+            if msg_type == MessageType.LIST_ROOMS_RESPONSE.value:
+                # Optional: supernode may include a user / requester tag.
+                resp_user = payload2.get("user") or payload2.get("requester")
+                if resp_user is None or resp_user == self.username:
+                    # Supernode may provide:
+                    #   - "joined":    rooms this user is currently in
+                    #   - "available": all rooms known globally
+                    # or just a flat "rooms" list.
+                    remote_joined = payload2.get("joined", []) or []
+                    remote_available = payload2.get("available", payload2.get("rooms", [])) or []
+
+                    local_snapshot = self._local_room_snapshot()
+                    local_joined = local_snapshot.get("joined", [])
+                    local_available = local_snapshot.get("available", [])
+
+                    joined = sorted(set(local_joined) | set(remote_joined))
+                    available = sorted(
+                        set(local_available)
+                        | set(remote_available)
+                        | set(joined)
+                    )
+
+                    rooms_result = {"joined": joined, "available": available}
+                    # Still let the generic handler process Lamport + integrity, etc.
+                    self._handle_event(incoming_env, incoming_addr)
+                    break
+
+            # Everything else is processed normally.
+            self._handle_event(incoming_env, incoming_addr)
+
+        if rooms_result is None:
+            self._debug("[middleware] LIST_ROOMS timed out; returning local snapshot.")
+            rooms_result = self._local_room_snapshot()
+
+        response_q.put(rooms_result)
+
+
     def _do_send_room_msg(self, room_id: str, text: str) -> None:
         """
         P2P room send:
@@ -851,6 +1099,24 @@ class Middleware:
             f"[middleware] Sent room message to {room_id} "
             f"(P2P to {len(sent_peers)} peers, plus supernode)."
         )
+
+    def _handle_message_ack(self, envelope: Dict[str, Any], addr: Tuple[str, int]) -> None:
+        """
+        Remove a DM from the retransmit buffer once we receive an ACK.
+        """
+        payload = envelope.get("payload", {}) or {}
+        acked_msg_id = payload.get("msg_id")
+        if not acked_msg_id:
+            return
+
+        with self._retransmit_lock:
+            if acked_msg_id in self._retransmit_buffer:
+                self._retransmit_buffer.pop(acked_msg_id, None)
+                self._debug(
+                    f"[middleware] Received MESSAGE_ACK for msg_id={acked_msg_id} "
+                    f"from {envelope.get('src_user')} at {addr}"
+                )
+
 
     def _do_lookup_user(self, target: str) -> None:
         lamport = self.lamport.tick()
