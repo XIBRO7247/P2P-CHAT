@@ -251,7 +251,7 @@ class CLI:
         cmds = self.command_tree.get("commands", {})
         node = cmds.get(root_name)
 
-        if not node:
+        if not node or (node.get("debug_only") and not self.middleware.debug):
             print(f"[cli] Unknown command: /{root_name}")
             return False
 
@@ -262,6 +262,12 @@ class CLI:
             sub_node = node["subcommands"].get(sub_name)
             if not sub_node:
                 break
+
+            # Respect debug_only on subcommands as well
+            if sub_node.get("debug_only") and not self.middleware.debug:
+                print(f"[cli] Unknown or disabled subcommand: /{root_name} {sub_name}")
+                return False
+
             node = sub_node
             idx += 1
 
@@ -414,14 +420,44 @@ class CLI:
         cmds = self.command_tree.get("commands", {})
         print("Available commands:")
         for name, node in cmds.items():
-            # Top-level help
+            # Skip debug-only commands if debug mode is off
+            if node.get("debug_only") and not self.middleware.debug:
+                continue
+
             if "subcommands" not in node:
                 print(" ", node.get("help", f"/{name} ..."))
             else:
                 print(" ", node.get("help", f"/{name} ..."))
                 for sub_name, sub_node in node["subcommands"].items():
+                    if sub_node.get("debug_only") and not self.middleware.debug:
+                        continue
                     print("   ", sub_node.get("help", f"/{name} {sub_name} ..."))
         return False
+
+    def _cmd_robot(self, args: list[str]) -> bool:
+        """
+        Open a DM session with the local robot user.
+        """
+        robot_name = getattr(self.middleware, "robot_username", "robot")
+        self._dm_session(robot_name)
+        return False
+
+
+    def _cmd_test_start(self, args: list[str]) -> bool:
+        """
+        Enable fault-injection test mode (debug only).
+        """
+        # Even if the command gets through, middleware will sanity-check debug.
+        self.middleware.enable_test_mode()
+        return False
+
+    def _cmd_test_stop(self, args: list[str]) -> bool:
+        """
+        Disable fault-injection test mode.
+        """
+        self.middleware.disable_test_mode()
+        return False
+
 
     def _cmd_exit(self, args: list[str]) -> bool:
         return True

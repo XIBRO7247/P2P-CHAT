@@ -66,6 +66,10 @@ class Middleware:
         # Friend / user state manager (owns persistence for friends + addresses)
         self.friend_manager = FriendManager(self.username, self.local_ip, self.listen_port)
 
+        # Local test robot (DM-only, no network)
+        self.robot_username = config.get("robot_username", "robot")
+
+
         # Persistent history managers (per local user)
         state_dir = config.get("state_dir", "state")
         self.dm_history = DMHistoryManager(self.username, state_dir)
@@ -123,6 +127,13 @@ class Middleware:
         self._retransmit_max_attempts = int(config.get("retransmit_max_attempts", 3))
         self._retransmit_interval = float(config.get("retransmit_interval_sec", 0.5))
 
+        # --- Test / fault-injection mode (debug-only feature) ---
+        # When enabled (via /test start), we occasionally drop or corrupt
+        # outbound messages to exercise HASH_ERROR + retransmit paths.
+        self.test_mode_enabled: bool = False
+        self._test_mode_counter: int = 0
+
+
 
     # ---------- Lifecycle ----------
 
@@ -174,15 +185,59 @@ class Middleware:
                 self._retransmit_buffer[msg_id] = entry
 
     def _send_envelope(
-        self,
-        env: Dict[str, Any],
-        addr: Tuple[str, int],
-        track: bool = True,
+            self,
+            env: Dict[str, Any],
+            addr: Tuple[str, int],
+            track: bool = True,
     ) -> None:
         """
         Thin wrapper around transport.send_raw that also records the message
         in the retransmit buffer (unless track=False).
+
+        When test_mode_enabled is True, we occasionally:
+          - drop a message entirely, or
+          - corrupt its payload to trigger HASH_ERROR at the receiver.
+
+        This is ONLY for manual testing via /test start/stop.
         """
+        # --- Fault injection path (debug/test mode only) ---
+        if self.test_mode_enabled and self.debug:
+            self._test_mode_counter += 1
+            n = self._test_mode_counter
+
+            # Example policy:
+            #   - every 7th tracked message: drop completely
+            #   - every 11th tracked message: corrupt payload (checksum mismatch)
+            # We skip HASH_ERROR itself to avoid infinite loops.
+            msg_type = env.get("type")
+            is_hash_err = (msg_type == MessageType.HASH_ERROR.value)
+
+            if track and not is_hash_err:
+                # Drop every 7th message
+                if n % 7 == 0:
+                    self._debug(
+                        f"[middleware][test] DROPPING outbound msg_id={env.get('msg_id')} "
+                        f"to {addr}"
+                    )
+                    return
+
+                # Corrupt every 11th message
+                if n % 11 == 0:
+                    corrupted = dict(env)
+                    # Tamper with payload but leave checksum alone → receiver complains
+                    payload = dict(corrupted.get("payload") or {})
+                    payload["__test_corrupted__"] = True
+                    corrupted["payload"] = payload
+                    self._debug(
+                        f"[middleware][test] CORRUPTING outbound msg_id={env.get('msg_id')} "
+                        f"to {addr}"
+                    )
+                    # We still send, but do not track in retransmit buffer; the *original*
+                    # (uncorrupted) message remains in the buffer for HASH_ERROR retries.
+                    self.transport.send_raw(corrupted, addr)
+                    return
+
+        # --- Normal / default behaviour ---
         self.transport.send_raw(env, addr)
         if track:
             self._register_retransmit(env, addr)
@@ -358,6 +413,34 @@ class Middleware:
     # Direct messages
     def send_direct_message(self, target: str, text: str) -> None:
         self._enqueue(("send_dm", {"target": target, "text": text}))
+
+    # ---------- Test mode (debug only) ----------
+
+    def enable_test_mode(self) -> None:
+        """
+        Enable fault-injection test mode.
+
+        Only meaningful when self.debug is True. In non-debug builds we
+        still allow the call, but just print a note.
+        """
+        if not self.debug:
+            print("[middleware] Test mode requested but debug=False in config.")
+            return
+        if self.test_mode_enabled:
+            print("[middleware] Test mode is already enabled.")
+            return
+        self.test_mode_enabled = True
+        self._test_mode_counter = 0
+        print("[middleware] TEST MODE ENABLED: injecting faults into outbound messages.")
+
+    def disable_test_mode(self) -> None:
+        """Disable fault-injection test mode."""
+        if not self.test_mode_enabled:
+            print("[middleware] Test mode is already disabled.")
+            return
+        self.test_mode_enabled = False
+        print("[middleware] TEST MODE DISABLED.")
+
 
     def get_dm_history(self, peer: str):
         """Used by the CLI to render DM conversation view."""
@@ -1381,6 +1464,11 @@ class Middleware:
     # ---------- Direct messages + address resolution ----------
 
     def _do_send_dm(self, target: str, text: str) -> None:
+        # Local robot DM: bypass friend checks and the network
+        if target == getattr(self, "robot_username", "robot"):
+            self._do_robot_dm(text)
+            return
+
         fm = self.friend_manager
 
         if target not in fm.friends:
@@ -1434,6 +1522,62 @@ class Middleware:
         self._notify_dm_listeners(target, self.username, text)
 
         print(f"[middleware] Sent DM to {target} at {ip}:{port}")
+
+    def _do_robot_dm(self, text: str) -> None:
+        """
+        Handle a DM to the local test robot.
+
+        - No network.
+        - Logs outgoing + incoming via DMHistoryManager.
+        - Notifies any DM listeners so the /dm or /robot UI live-updates.
+        """
+        peer = getattr(self, "robot_username", "robot")
+
+        # Outgoing: "me" -> robot
+        try:
+            self.dm_history.log_outgoing(peer, self.username, text)
+        except Exception as e:
+            print(f"[middleware] Error logging outgoing robot DM: {e!r}")
+        self._notify_dm_listeners(peer, self.username, text)
+
+        # Generate robot reply
+        reply = self._robot_reply(text)
+        if reply is None:
+            return
+
+        # Incoming: robot -> me
+        try:
+            self.dm_history.log_incoming(peer, peer, reply)
+        except Exception as e:
+            print(f"[middleware] Error logging incoming robot DM: {e!r}")
+        self._notify_dm_listeners(peer, peer, reply)
+
+    def _robot_reply(self, text: str) -> str | None:
+        """
+        Very simple local robot: mainly echoes for DM testing.
+        """
+        stripped = (text or "").strip()
+        if not stripped:
+            return "Say something and I'll echo it back to you."
+
+        low = stripped.lower()
+
+        if low in {"help", "/help"}:
+            return (
+                "I'm the local debug robot.\n"
+                "- I live entirely in your client (no network).\n"
+                "- I mainly echo your messages so you can test DMs.\n"
+                "- Type anything, or 'ping', 'hi', etc."
+            )
+
+        if low in {"hi", "hello", "hey"}:
+            return "Hello! I'm the robot. I'm just here so you can test DM chat."
+
+        if low == "ping":
+            return "pong"
+
+        return f"Echo: {stripped}"
+
 
     def _queue_pending_dm(self, target: str, text: str, timestamp: int) -> None:
         """

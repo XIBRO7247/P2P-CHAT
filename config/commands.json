@@ -84,6 +84,29 @@
       "handler": "self._cmd_exit",
       "help": "/quit - exit client",
       "min_args": 0
+    },
+        "robot": {
+      "help": "/robot - open a DM session with the local test robot",
+      "handler": "self._cmd_robot",
+      "min_args": 0
+    },
+    "test": {
+      "help": "/test start|stop (debug only)",
+      "debug_only": true,
+      "subcommands": {
+        "start": {
+          "help": "/test start  – enable fault-injection test mode (debug only)",
+          "handler": "self._cmd_test_start",
+          "min_args": 0,
+          "debug_only": true
+        },
+        "stop": {
+          "help": "/test stop   – disable fault-injection test mode (debug only)",
+          "handler": "self._cmd_test_stop",
+          "min_args": 0,
+          "debug_only": true
+        }
+      }
     }
   }
 }
