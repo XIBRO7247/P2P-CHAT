@@ -1,8 +1,11 @@
 import socket
 import threading
 import time
+import base64
 from queue import Queue, Empty
 from typing import Any, Dict, Tuple, Optional, Set
+from pathlib import Path
+
 
 import json
 
@@ -18,6 +21,7 @@ from .heartbeat_manager import HeartbeatManager
 from .friend_manager import FriendManager
 from .dm_history import DMHistoryManager
 from .room_history import RoomHistoryManager
+from .file_index import FileIndex
 
 
 class Middleware:
@@ -44,11 +48,30 @@ class Middleware:
         self.transport = UDPTransport("0.0.0.0", start_port, end_port)
         self.listen_port = self.transport.listen_port
 
-        # Supernode address
-        self.supernode_addr = (
-            config["supernode_host"],
-            int(config["supernode_port"]),
-        )
+        # Supernode addresses (multi-supernode support)
+        raw_supers = self.config.get("supernodes")
+        supernodes: list[Tuple[str, int]] = []
+
+        if isinstance(raw_supers, list) and raw_supers:
+            for entry in raw_supers:
+                if not isinstance(entry, dict):
+                    continue
+                host = entry.get("host")
+                port = entry.get("port")
+                if host and port is not None:
+                    supernodes.append((host, int(port)))
+
+        if not supernodes:
+            # Fallback to single supernode_host / supernode_port
+            supernodes.append(
+                (
+                    self.config["supernode_host"],
+                    int(self.config["supernode_port"]),
+                )
+            )
+
+        self.supernodes: list[Tuple[str, int]] = supernodes
+        self.supernode_addr: Tuple[str, int] = self.supernodes[0]
 
         # Managers
         self.room_manager = RoomManager()
@@ -126,6 +149,12 @@ class Middleware:
         self._retransmit_ttl = float(config.get("retransmit_ttl_sec", 10.0))
         self._retransmit_max_attempts = int(config.get("retransmit_max_attempts", 3))
         self._retransmit_interval = float(config.get("retransmit_interval_sec", 0.5))
+
+        self.file_index = FileIndex(self.username)
+        self.file_chunk_size = 65536
+
+        # Cache of last /file list results: file_id -> metadata
+        self.file_catalog: Dict[str, Dict[str, Any]] = {}
 
         # --- Test / fault-injection mode (debug-only feature) ---
         # When enabled (via /test start), we occasionally drop or corrupt
@@ -241,6 +270,17 @@ class Middleware:
         self.transport.send_raw(env, addr)
         if track:
             self._register_retransmit(env, addr)
+
+    def _send_to_supernodes(self, env: Dict[str, Any], track: bool = True) -> None:
+        """
+        Send an envelope to all known supernodes.
+
+        We only track retransmits against the first supernode to avoid
+        duplicating entries in the retransmit buffer.
+        """
+        for idx, addr in enumerate(self.supernodes):
+            self._send_envelope(env, addr, track=(track and idx == 0))
+
 
     def _check_retransmissions(self) -> None:
         """
@@ -393,6 +433,36 @@ class Middleware:
         available = sorted(known_from_members | history_rooms | set(joined))
         return {"joined": joined, "available": available}
 
+    def resync_room_history(self, room_id: str) -> None:
+        """
+        Clear our local copy of a room's history (chunks + local log)
+        and then re-run the distributed history sync for that room.
+        """
+        self._debug(f"[middleware] Resync requested for room {room_id}")
+
+        # 1) Drop local chunks
+        try:
+            if hasattr(self.storage, "delete_room"):
+                self.storage.delete_room(room_id)
+                self._debug(f"[middleware] Deleted local chunks for room {room_id}")
+        except Exception as e:
+            self._debug(f"[middleware] Error deleting chunks for {room_id}: {e!r}")
+
+        # 2) Drop local room-history view
+        try:
+            if hasattr(self.room_history, "clear_room"):
+                self.room_history.clear_room(room_id)
+                self._debug(f"[middleware] Cleared local RoomHistory for {room_id}")
+        except Exception as e:
+            self._debug(f"[middleware] Error clearing RoomHistory for {room_id}: {e!r}")
+
+        # 3) Re-sync via existing chunk sync machinery
+        try:
+            self._sync_room_history(room_id)
+        except Exception as e:
+            self._debug(f"[middleware] Error during resync for {room_id}: {e!r}")
+
+
     # Friend system
     def send_friend_request(self, target: str) -> None:
         self._enqueue(("friend_request", {"target": target}))
@@ -518,6 +588,281 @@ class Middleware:
                 q.put_nowait((sender, text))
             except Exception:
                 pass
+
+    def export_chats_plaintext(self, out_dir: str = "exports") -> None:
+        """
+        Dump DM + room histories to simple plaintext log files.
+
+        - <out_dir>/<username>_dms.log
+        - <out_dir>/<username>_rooms.log
+
+        If config['logging']['file'] exists, we copy it alongside for debug logs.
+        """
+        base = Path(out_dir)
+        base.mkdir(parents=True, exist_ok=True)
+
+        # ---- DMs ----
+        try:
+            dms = self.dm_history.get_all()
+        except Exception as e:
+            self._debug(f"[middleware] Error reading DM history for export: {e!r}")
+            dms = {}
+
+        dm_path = base / f"{self.username}_dms.log"
+        try:
+            with dm_path.open("w", encoding="utf-8") as f:
+                for peer, msgs in sorted(dms.items()):
+                    f.write(f"=== DMs with {peer} ===\n")
+                    for sender, text in msgs:
+                        label = "me" if sender == self.username else sender
+                        f.write(f"[{label}] {text}\n")
+                    f.write("\n")
+            print(f"[middleware] Exported DM history to {dm_path}")
+        except Exception as e:
+            self._debug(f"[middleware] Error exporting DM history: {e!r}")
+
+        # ---- Rooms ----
+        try:
+            rooms = self.room_history.get_all()
+        except Exception as e:
+            self._debug(f"[middleware] Error reading room history for export: {e!r}")
+            rooms = {}
+
+        room_path = base / f"{self.username}_rooms.log"
+        try:
+            with room_path.open("w", encoding="utf-8") as f:
+                for room_id, msgs in sorted(rooms.items()):
+                    f.write(f"=== Room {room_id} ===\n")
+                    for sender, text in msgs:
+                        label = "me" if sender == self.username else sender
+                        f.write(f"[{label}] {text}\n")
+                    f.write("\n")
+            print(f"[middleware] Exported room history to {room_path}")
+        except Exception as e:
+            self._debug(f"[middleware] Error exporting room history: {e!r}")
+
+        # ---- Optional: copy debug log file if configured ----
+        logging_cfg = self.config.get("logging", {}) or {}
+        log_file = logging_cfg.get("file")
+        if log_file:
+            src = Path(log_file)
+            if src.exists():
+                dst = base / src.name
+                try:
+                    dst.write_bytes(src.read_bytes())
+                    print(f"[middleware] Copied debug log {src} -> {dst}")
+                except Exception as e:
+                    self._debug(f"[middleware] Error copying debug log: {e!r}")
+
+    def file_send(self, target, filepath):
+        p = Path(filepath).expanduser()
+        if not p.exists():
+            print("[file] File not found")
+            return
+
+        data = p.read_bytes()
+        size = len(data)
+        sha = sha256_hash(data)
+        file_id = sha
+
+        # store locally
+        dest = self.file_index.base_dir / f"{file_id[:8]}_{p.name}"
+        dest.write_bytes(data)
+
+        self.file_index.add(file_id, p.name, size, sha, dest, True)
+
+        payload = {
+            "file_id": file_id,
+            "name": p.name,
+            "size": size,
+            "sha256": sha,
+            "allowed_users": [self.username, target]
+        }
+
+        env = make_envelope(
+            MessageType.FILE_REGISTER,
+            self.username,
+            self.local_ip, self.listen_port,
+            self.lamport.tick(),
+            payload
+        )
+        self._send_to_supernodes(env)
+
+        print(f"[file] Sent {p.name}, id={file_id}")
+
+    def file_list(self):
+        env = make_envelope(
+            MessageType.FILE_LIST,
+            self.username,
+            self.local_ip, self.listen_port,
+            self.lamport.tick(),
+            {}
+        )
+        self._send_to_supernodes(env)
+
+    def _get_file_info(self, file_id):
+        env = make_envelope(
+            MessageType.FILE_INFO,
+            self.username,
+            self.local_ip, self.listen_port,
+            self.lamport.tick(),
+            {"file_id": file_id}
+        )
+        self._send_to_supernodes(env)
+
+    def file_get(self, file_id: str):
+        # --- Optional: short ID prefix support using last /file list ---
+        # Resolve "3647e9c7" style prefixes to the full 64-char SHA256
+        full_id = file_id
+        if len(file_id) < 64 and hasattr(self, "file_catalog"):
+            matches = [fid for fid in self.file_catalog.keys()
+                       if fid.startswith(file_id)]
+            if len(matches) == 0:
+                print(f"[file] Unknown file id prefix '{file_id}'. Try /file list again.")
+                return
+            elif len(matches) > 1:
+                print(f"[file] Ambiguous id prefix '{file_id}' matches {len(matches)} files; "
+                      f"use a longer prefix.")
+                return
+            else:
+                full_id = matches[0]
+
+        # --- Ask supernode for file metadata ---
+        self.pending_file_info = None
+        self._get_file_info(full_id)
+
+        # wait for info (similar to export)
+        t = time.time() + 5
+        while time.time() < t and self.pending_file_info is None:
+            time.sleep(0.05)
+
+        meta = self.pending_file_info
+        if not meta or "error" in meta:
+            print("[file] Cannot fetch file info.")
+            return
+
+        seeders = meta["seeders"]
+        if not seeders:
+            print("[file] No seeders available.")
+            return
+
+        # choose first seeder
+        seeder = seeders[0]
+
+        # Wrapper you added earlier – resolves user -> (ip, port)
+        addr = self.get_address_for_user(seeder)
+        if not addr:
+            print(f"[file] Cannot resolve {seeder}")
+            return
+        ip, port = addr
+
+        size = meta["size"]
+        name = meta["name"]
+        sha = meta["sha256"]
+
+        # --- Download in base64-encoded chunks and accumulate in memory ---
+        buf = bytearray()
+        offset = 0
+
+        while offset < size:
+            length = min(self.file_chunk_size, size - offset)
+
+            req = make_envelope(
+                MessageType.FILE_CHUNK_REQUEST,
+                self.username,
+                self.local_ip, self.listen_port,
+                self.lamport.tick(),
+                {"file_id": full_id, "offset": offset, "length": length},
+            )
+            self._send_envelope(req, (ip, port))
+
+            # wait for chunk from seeder
+            got = False
+            t = time.time() + 5
+            while time.time() < t:
+                if hasattr(self, "pending_chunk") and \
+                        self.pending_chunk.get("file_id") == full_id and \
+                        self.pending_chunk.get("offset") == offset:
+                    # payload["data"] is *base64 string* -> decode to bytes
+                    raw = base64.b64decode(self.pending_chunk["data"])
+                    buf.extend(raw)
+                    del self.pending_chunk
+                    offset += len(raw)
+                    got = True
+                    break
+                time.sleep(0.01)
+
+            if not got:
+                print("[file] Timeout on chunk")
+                return
+
+        # --- Verify SHA-256 against metadata ---
+        if sha256_hash(bytes(buf)) != sha:
+            print("[file] Hash mismatch")
+            return
+
+        # --- Persist to disk and register as seeder ---
+        dest = self.file_index.base_dir / f"{full_id[:8]}_{name}"
+        dest.write_bytes(buf)
+
+        self.file_index.add(full_id, name, size, sha, dest, True)
+
+        # tell supernode we now seed this file too
+        env = make_envelope(
+            MessageType.FILE_SEED_UPDATE,
+            self.username,
+            self.local_ip, self.listen_port,
+            self.lamport.tick(),
+            {"file_id": full_id, "action": "add"},
+        )
+        self._send_to_supernodes(env)
+
+        print(f"[file] Download completed: {dest}")
+
+    def _handle_file_chunk_request(self, payload, addr):
+        file_id = payload["file_id"]
+        offset = payload["offset"]
+        length = payload["length"]
+
+        meta = self.file_index.get(file_id)
+        if not meta:
+            return
+
+        path = Path(meta["path"])
+        data = path.read_bytes()[offset:offset + length]
+        b64 = base64.b64encode(data).decode()
+
+        resp = make_envelope(
+            MessageType.FILE_CHUNK_RESPONSE,
+            self.username,
+            self.local_ip, self.listen_port,
+            self.lamport.tick(),
+            {"file_id": file_id, "offset": offset, "data": b64}
+        )
+        self._send_envelope(resp, addr)
+
+    def file_purge(self, file_id):
+        meta = self.file_index.get(file_id)
+        if not meta:
+            print("[file] No such local file")
+            return
+
+        p = Path(meta["path"])
+        if p.exists():
+            p.unlink()
+
+        self.file_index.mark_seeder(file_id, False)
+
+        env = make_envelope(
+            MessageType.FILE_SEED_UPDATE,
+            self.username,
+            self.local_ip, self.listen_port,
+            self.lamport.tick(),
+            {"file_id": file_id, "action": "remove"}
+        )
+        self._send_to_supernodes(env)
+
+        print(f"[file] Purged local copy of {file_id}")
 
     # ---------- Internal plumbing ----------
 
@@ -902,6 +1247,44 @@ class Middleware:
                 "[middleware] Ignoring PENDING_FRIEND_DELIVERED (supernode-only)."
             )
 
+        elif msg_type == MessageType.SUPERNODE_LIST_UPDATE.value:
+            supers = payload.get("supernodes") or []
+            updated: list[Tuple[str, int]] = []
+            for entry in supers:
+                host = entry.get("host")
+                port = entry.get("port")
+                if host and port is not None:
+                    updated.append((host, int(port)))
+
+            if updated:
+                self.supernodes = updated
+                self.supernode_addr = self.supernodes[0]
+                self._debug(
+                    "[middleware] Updated supernode list from SUPERNODE_LIST_UPDATE: "
+                    + ", ".join(f"{h}:{p}" for h, p in self.supernodes)
+                )
+        elif msg_type == MessageType.FILE_LIST_RESPONSE.value:
+            files = payload.get("files", [])
+            # reset cache on each list
+            self.file_catalog = {}
+
+            if not files:
+                print("[file] No files visible.")
+            for f in files:
+                fid = f["file_id"]
+                self.file_catalog[fid] = f
+                # still show prefix to the user
+                print(f"{fid[:8]}  {f['name']}  {f['size']} bytes  seeders={f['seeders']}")
+
+
+        elif msg_type == MessageType.FILE_INFO_RESPONSE.value:
+            self.pending_file_info = payload
+
+        elif msg_type == MessageType.FILE_CHUNK_REQUEST.value:
+            self._handle_file_chunk_request(payload, addr)
+        elif msg_type == MessageType.FILE_CHUNK_RESPONSE.value:
+            self.pending_chunk = payload
+
     def _handle_hash_error(self, envelope: Dict[str, Any], addr: Tuple[str, int]) -> None:
         """
         Respond to a HASH_ERROR from a peer: if it references a msg_id we
@@ -983,7 +1366,7 @@ class Middleware:
             lamport,
             payload,
         )
-        self._send_envelope(data, self.supernode_addr)
+        self._send_to_supernodes(data)
         # Broadcast presence as "ONLINE" to supernode, friends, and room peers.
         self._broadcast_presence("ONLINE")
 
@@ -998,7 +1381,7 @@ class Middleware:
             lamport,
             payload,
         )
-        self._send_envelope(data, self.supernode_addr)
+        self._send_to_supernodes(data)
 
     def _do_leave_room(self, room_id: str) -> None:
         """
@@ -1025,7 +1408,7 @@ class Middleware:
             payload,
         )
         # No need to track or ACK leave messages
-        self._send_envelope(env, self.supernode_addr, track=False)
+        self._send_to_supernodes(env, track=False)
         self._debug(f"[middleware] Sent LEAVE_ROOM for {room_id} to supernode.")
 
 
@@ -1053,7 +1436,7 @@ class Middleware:
         )
 
         try:
-            self._send_envelope(env, self.supernode_addr)
+            self._send_to_supernodes(env)
             self._debug("[middleware] Sent LIST_ROOMS request to supernode.")
         except Exception as e:
             self._debug(f"[middleware] Error sending LIST_ROOMS to supernode: {e!r}")
@@ -1174,7 +1557,7 @@ class Middleware:
                 self._debug(f"[middleware] Error sending room msg to {peer} at {ip}:{port}: {e!r}")
 
         try:
-            self._send_envelope(data, self.supernode_addr)
+            self._send_to_supernodes(data)
         except Exception as e:
             self._debug(f"[middleware] Error sending room msg to supernode: {e!r}")
 
@@ -1212,7 +1595,7 @@ class Middleware:
             lamport,
             payload,
         )
-        self._send_envelope(data, self.supernode_addr)
+        self._send_to_supernodes(data)
 
     # ---------- Friend commands ----------
 
@@ -1224,7 +1607,7 @@ class Middleware:
             lamport = self.lamport.tick()
             env, msg = self.friend_manager.build_friend_request(target, lamport)
             if env is not None:
-                self._send_envelope(env, self.supernode_addr)
+                self._send_to_supernodes(env)
             if msg:
                 print(f"[middleware] {msg}")
             return
@@ -1306,7 +1689,7 @@ class Middleware:
                 self._debug(f"[middleware] No cached address for {user}; skipping direct FRIEND_RESPONSE.")
             # also tell supernode
             try:
-                self._send_envelope(env, self.supernode_addr)
+                self._send_to_supernodes(env)
             except Exception as e:
                 self._debug(f"[middleware] Error sending FRIEND_RESPONSE to supernode: {e!r}")
         if msg:
@@ -1431,7 +1814,7 @@ class Middleware:
             lamport = self.lamport.tick()
             env, msg = self.friend_manager.build_friend_request(target, lamport)
             if env is not None:
-                self._send_envelope(env, self.supernode_addr)
+                self._send_to_supernodes(env)
             if msg:
                 print(f"[middleware] {msg}")
             self.pending_intros.pop(target, None)
@@ -1457,7 +1840,7 @@ class Middleware:
             lamport = self.lamport.tick()
             env, msg = self.friend_manager.build_friend_request(target, lamport)
             if env is not None:
-                self._send_envelope(env, self.supernode_addr)
+                self._send_to_supernodes(env)
             if msg:
                 print(f"[middleware] {msg}")
 
@@ -1780,6 +2163,13 @@ class Middleware:
         # because address propagation is friend-only.
         return addr
 
+    def get_address_for_user(self, user: str):
+        """
+        Backwards-compatible wrapper for older call sites (e.g. file transfer)
+        that need a socket address for a given username.
+        """
+        return self._ensure_fresh_address_for_user(user)
+
     # ---- Step 1: heartbeat-based identity verification ----
 
     def _verify_identity_via_heartbeat(
@@ -2060,7 +2450,7 @@ class Middleware:
             lamport,
             payload,
         )
-        self._send_envelope(env, self.supernode_addr)
+        self._send_to_supernodes(env)
 
         self._debug(f"[middleware] Resolving address for {target} via supernode...")
 
@@ -2583,7 +2973,7 @@ class Middleware:
             lamport,
             payload,
         )
-        self._send_envelope(env, self.supernode_addr)
+        self._send_to_supernodes(env)
         self._debug(f"[middleware] Announced NEW_CHUNK {chunk_id} for room {room_id} to supernode.")
 
     # ---------- Replication helper ----------
@@ -2767,7 +3157,7 @@ class Middleware:
             lamport,
             payload,
         )
-        self._send_envelope(env, self.supernode_addr)
+        self._send_to_supernodes(env)
         self._debug(
             f"[middleware] Notified supernode that holder for {for_user} is now {holder}."
         )
@@ -2792,7 +3182,7 @@ class Middleware:
             lamport,
             payload,
         )
-        self._send_envelope(env, self.supernode_addr)
+        self._send_to_supernodes(env)
         self._debug(
             f"[middleware] Offloaded {len(msgs)} pending DM(s) for {target} to supernode (last resort)."
         )
@@ -2920,7 +3310,7 @@ class Middleware:
             lamport,
             payload,
         )
-        self._send_envelope(env, self.supernode_addr)
+        self._send_to_supernodes(env)
         self._debug(
             f"[middleware] Notified supernode that we delivered {count} pending DM(s) to {for_user}."
         )
@@ -3093,7 +3483,7 @@ class Middleware:
             lamport,
             payload,
         )
-        self._send_envelope(env, self.supernode_addr)
+        self._send_to_supernodes(env)
         self._debug(
             f"[middleware] Offloaded {len(events)} pending friend event(s) for {for_user} "
             f"to supernode (last resort)."
@@ -3138,7 +3528,7 @@ class Middleware:
             lamport,
             payload,
         )
-        self._send_envelope(env, self.supernode_addr)
+        self._send_to_supernodes(env)
         self._debug(
             f"[middleware] Notified supernode that we delivered {count} pending "
             f"friend event(s) to {for_user}."
@@ -3165,7 +3555,7 @@ class Middleware:
 
         # Always notify supernode
         try:
-            self._send_envelope(env, self.supernode_addr)
+            self._send_envelope(env, self._send_to_supernodes)
         except Exception as e:
             self._debug(f"[middleware] Error sending USER_STATUS to supernode: {e!r}")
 

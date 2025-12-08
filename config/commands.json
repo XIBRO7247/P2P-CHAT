@@ -1,7 +1,7 @@
 {
   "commands": {
     "room": {
-      "help": "/room ... - room utilities",
+      "help": "/room . - room utilities",
       "subcommands": {
         "msg": {
           "handler": "self._cmd_room_msg",
@@ -17,6 +17,11 @@
           "handler": "self._cmd_room_list",
           "help": "/room list - show rooms you have joined and all known rooms",
           "min_args": 0
+        },
+        "resync": {
+          "handler": "self._cmd_room_resync",
+          "help": "/room resync <room> - drop local history and re-pull from peers",
+          "min_args": 1
         }
       }
     },
@@ -70,22 +75,7 @@
       "help": "/dm <user> [text] - open DM view (optionally send first message)",
       "min_args": 1
     },
-    "help": {
-      "handler": "self._cmd_help",
-      "help": "/help - show available commands",
-      "min_args": 0
-    },
-    "exit": {
-      "handler": "self._cmd_exit",
-      "help": "/exit - exit client",
-      "min_args": 0
-    },
-    "quit": {
-      "handler": "self._cmd_exit",
-      "help": "/quit - exit client",
-      "min_args": 0
-    },
-        "robot": {
+    "robot": {
       "help": "/robot - open a DM session with the local test robot",
       "handler": "self._cmd_robot",
       "min_args": 0
@@ -107,6 +97,57 @@
           "debug_only": true
         }
       }
+    },
+    "export": {
+      "help": "/export . - export data",
+      "subcommands": {
+        "chats": {
+          "handler": "self._cmd_export_chats",
+          "help": "/export chats [out_dir] - export DM + room history logs",
+          "min_args": 0
+        }
+      }
+    },
+    "file": {
+      "help": "Torrent-style file transfer",
+      "subcommands": {
+        "send": {
+          "handler": "self._cmd_file_send",
+          "help": "/file send <user> <path>",
+          "min_args": 2
+        },
+        "list": {
+          "handler": "self._cmd_file_list",
+          "help": "/file list",
+          "min_args": 0
+        },
+        "get": {
+          "handler": "self._cmd_file_get",
+          "help": "/file get <file_id>",
+          "min_args": 1
+        },
+        "purge": {
+          "handler": "self._cmd_file_purge",
+          "help": "/file purge <file_id>",
+          "min_args": 1
+        }
+      }
+    },
+    "help": {
+      "handler": "self._cmd_help",
+      "help": "/help - show available commands",
+      "min_args": 0
+    },
+    "exit": {
+      "handler": "self._cmd_exit",
+      "help": "/exit - exit client",
+      "min_args": 0
+    },
+    "quit": {
+      "handler": "self._cmd_exit",
+      "help": "/quit - exit client",
+      "min_args": 0
     }
   }
 }
+

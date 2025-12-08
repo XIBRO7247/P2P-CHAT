@@ -23,6 +23,12 @@ class MessageType(Enum):
     # Room leaving
     LEAVE_ROOM = "leave_room"
 
+    CHUNK_REQUEST = "CHUNK_REQUEST"
+    CHUNK_RESPONSE = "CHUNK_RESPONSE"
+
+    REGISTER_FAIL = "register_fail"
+    MESSAGE_ACK = "message_ack"
+
     # Friend system ...
     FRIEND_REQUEST = "friend_request"
     FRIEND_RESPONSE = "FRIEND_RESPONSE"
@@ -54,6 +60,25 @@ class MessageType(Enum):
     # Hash / integrity signalling
     HASH_ERROR = "HASH_ERROR"
 
+    # Supernode discovery / multi-supernode support
+    SUPERNODE_HELLO = "SUPERNODE_HELLO"
+    SUPERNODE_LIST_UPDATE = "SUPERNODE_LIST_UPDATE"
+
+    # Supernode replication (state cloning)
+    SUPERNODE_REPLICA_REQUEST = "SUPERNODE_REPLICA_REQUEST"
+    SUPERNODE_REPLICA_STATE = "SUPERNODE_REPLICA_STATE"
+
+
+    # -------- File transfer (torrent-style) --------
+    FILE_REGISTER = "FILE_REGISTER"  # client -> supernode
+    FILE_REGISTERED = "FILE_REGISTERED"  # supernode -> client
+    FILE_LIST = "FILE_LIST"  # client -> supernode
+    FILE_LIST_RESPONSE = "FILE_LIST_RESPONSE"  # supernode -> client
+    FILE_INFO = "FILE_INFO"  # client -> supernode
+    FILE_INFO_RESPONSE = "FILE_INFO_RESPONSE"  # supernode -> client
+    FILE_SEED_UPDATE = "FILE_SEED_UPDATE"  # client -> supernode
+    FILE_CHUNK_REQUEST = "FILE_CHUNK_REQUEST"  # client -> seeder
+    FILE_CHUNK_RESPONSE = "FILE_CHUNK_RESPONSE"  # seeder -> client
 
 def md5_checksum(data: bytes) -> str:
     """

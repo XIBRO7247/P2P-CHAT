@@ -372,6 +372,20 @@ class CLI:
     def _cmd_rooms(self, args: list[str]) -> bool:
         return self._cmd_room_list(args)
 
+    def _cmd_room_resync(self, args: list[str]) -> bool:
+        """
+        Clear and re-pull a room's message history from peers.
+        Usage: /room resync <room_id>
+        """
+        if not args:
+            print("[cli] Usage: /room resync <room>")
+            return False
+        room = args[0]
+        self.middleware.resync_room_history(room)
+        print(f"[cli] Requested resync for room {room}.")
+        return False
+
+
     def _cmd_friend_add(self, args: list[str]) -> bool:
         user = args[0]
         self.middleware.send_friend_request(user)
@@ -458,6 +472,31 @@ class CLI:
         self.middleware.disable_test_mode()
         return False
 
+    def _cmd_export_chats(self, args: list[str]) -> bool:
+        """
+        Export DM + room histories to plaintext log files.
+        Usage: /export chats [out_dir]
+        """
+        out_dir = args[0] if args else "exports"
+        self.middleware.export_chats_plaintext(out_dir)
+        return False
+
+    def _cmd_file_send(self, args):
+        user = args[0]
+        path = " ".join(args[1:])
+        self.middleware.file_send(user, path)
+
+    def _cmd_file_list(self, args):
+        self.middleware.file_list()
+
+    def _cmd_file_get(self, args):
+        self.middleware.file_get(args[0])
+
+    def _cmd_file_forward(self, args):
+        self.middleware.file_send(args[0], args[1])  # forward = send with allowed_users
+
+    def _cmd_file_purge(self, args):
+        self.middleware.file_purge(args[0])
 
     def _cmd_exit(self, args: list[str]) -> bool:
         return True

@@ -23,11 +23,23 @@ os.chdir(SCRIPT_DIR)
 
 class Supernode:
     def __init__(self, host: str, port: int):
-        self.host, self.port = host, port
+        # Bind on the requested host/port, but advertise a concrete IP
+        # if we were given 0.0.0.0 (wildcard).
+        self.bind_host = host
+        self.port = port
+
+        if host == "0.0.0.0":
+            # Use a real LAN/loopback IP for telling clients/supernodes where we are
+            self.host = self._guess_lan_ip()
+        else:
+            self.host = host
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((host, port))
+        self.sock.bind((self.bind_host, port))
 
         self.lamport = LamportClock()
+
+        self.peer_supernodes: set[tuple[str, int]] = set()
 
         # username -> (ip, port)
         self.users: Dict[str, tuple[str, int]] = {}
@@ -62,6 +74,8 @@ class Supernode:
         #   "timestamp": int,
         # }]
         self.friend_super_store: Dict[str, List[Dict[str, Any]]] = {}
+
+        self.files = {}  # file_id -> metadata
 
         self._running = threading.Event()
         # Thread-safe queue for received envelopes
@@ -281,6 +295,24 @@ class Supernode:
                 f"[supernode] Received HASH_ERROR from {src_user} at {addr}: "
                 f"reason={reason}, details={details}"
             )
+        elif msg_type == MessageType.SUPERNODE_HELLO.value:
+            self._handle_supernode_hello(payload)
+        elif msg_type == MessageType.SUPERNODE_REPLICA_REQUEST.value:
+            # payload comes from another supernode; sender addr is in `addr`
+            self._handle_supernode_replica_request(payload, addr)
+
+        elif msg_type == MessageType.SUPERNODE_REPLICA_STATE.value:
+            self._handle_supernode_replica_state(payload)
+
+        elif msg_type == MessageType.FILE_REGISTER.value:
+            self._handle_file_register(src_user, addr, payload)
+        elif msg_type == MessageType.FILE_LIST.value:
+            self._handle_file_list(src_user, addr, payload)
+        elif msg_type == MessageType.FILE_INFO.value:
+            self._handle_file_info(src_user, addr, payload)
+        elif msg_type == MessageType.FILE_SEED_UPDATE.value:
+            self._handle_file_seed_update(src_user, addr, payload)
+
 
         else:
             # Ignore unknown or peer-only types such as FRIEND_INTRO, heartbeats, etc.
@@ -996,6 +1028,320 @@ class Supernode:
             # for that user is now stale.
             self.friend_super_store.pop(for_user, None)
 
+    def _handle_supernode_hello(self, payload):
+        host = payload["host"]
+        port = int(payload["port"])
+        addr = (host, port)
+
+        if addr not in self.peer_supernodes:
+            self.peer_supernodes.add(addr)
+            print(f"[supernode] Registered peer supernode {addr}")
+            # Push updated supernode list to clients
+            self._broadcast_supernode_list()
+
+    def _handle_supernode_replica_request(self, payload: Dict[str, Any], sender: Tuple[str, int]) -> None:
+        """
+        Another supernode has asked us for a full snapshot of our state so it can
+        become an identical replica.
+
+        We MUST only send JSON-serialisable types, so we convert all sets to lists.
+        """
+        # users: username -> (ip, port) is already JSON-friendly
+        users_snapshot = dict(self.users)
+
+        # rooms: room_id -> set(usernames) => list(usernames)
+        rooms_snapshot: Dict[str, List[str]] = {
+            room_id: list(members) for room_id, members in self.rooms.items()
+        }
+
+        # files: file_id -> metadata; convert any sets inside to lists
+        files_snapshot: Dict[str, Dict[str, Any]] = {}
+        for fid, meta in self.files.items():
+            enc = dict(meta)
+            if isinstance(enc.get("allowed"), set):
+                enc["allowed"] = list(enc["allowed"])
+            if isinstance(enc.get("seeders"), set):
+                enc["seeders"] = list(enc["seeders"])
+            files_snapshot[fid] = enc
+
+        # dm_holders: username -> set(holders) => list(holders)
+        dm_holders_snapshot: Dict[str, List[str]] = {
+            user: list(holders) for user, holders in self.dm_holders.items()
+        }
+
+        # pending_friend_requests: target_user -> set(requester_usernames) => list(...)
+        pfr_snapshot: Dict[str, List[str]] = {
+            target: list(requesters)
+            for target, requesters in self.pending_friend_requests.items()
+        }
+
+        # pending_friend_responses, dm_super_store, friend_super_store and user_status
+        # are already dicts of lists/dicts/strings, so they should be JSON-safe.
+        snapshot = {
+            "users": users_snapshot,
+            "rooms": rooms_snapshot,
+            "files": files_snapshot,
+            "dm_holders": dm_holders_snapshot,
+            "pending_friend_requests": pfr_snapshot,
+            "pending_friend_responses": self.pending_friend_responses,
+            "dm_super_store": self.dm_super_store,
+            "friend_super_store": self.friend_super_store,
+            "user_status": self.user_status,
+        }
+
+        env = make_envelope(
+            MessageType.SUPERNODE_REPLICA_STATE,
+            "supernode",
+            self.host,
+            self.port,
+            self.lamport.tick(),
+            snapshot,
+        )
+        self._send(env, sender)
+        print(f"[supernode] Sent replica snapshot to peer {sender}")
+
+    def _handle_supernode_replica_state(self, payload: Dict[str, Any]) -> None:
+        """
+        Merge a full replica snapshot from another supernode into our own state.
+        This is called on the *new* supernode when it first joins the cluster.
+        """
+
+        # users: username -> (ip, port)
+        incoming_users: Dict[str, Tuple[str, int]] = payload.get("users", {}) or {}
+        self.users.update(incoming_users)
+
+        # rooms: room_id -> list(usernames) -> convert back to sets and merge
+        incoming_rooms: Dict[str, List[str]] = payload.get("rooms", {}) or {}
+        for room_id, members_list in incoming_rooms.items():
+            members_set = set(members_list)
+            if room_id not in self.rooms:
+                self.rooms[room_id] = members_set
+            else:
+                self.rooms[room_id].update(members_set)
+
+        # files: file_id -> metadata (with "allowed" and "seeders" as lists)
+        incoming_files: Dict[str, Dict[str, Any]] = payload.get("files", {}) or {}
+        for fid, meta in incoming_files.items():
+            if fid not in self.files:
+                # convert lists back to sets internally
+                m = dict(meta)
+                if isinstance(m.get("allowed"), list):
+                    m["allowed"] = set(m["allowed"])
+                if isinstance(m.get("seeders"), list):
+                    m["seeders"] = set(m["seeders"])
+                self.files[fid] = m
+            else:
+                existing = self.files[fid]
+                # merge seeders
+                existing_seeders = set(existing.get("seeders", []))
+                incoming_seeders = set(meta.get("seeders", []))
+                existing["seeders"] = existing_seeders | incoming_seeders
+                # allowed: union if present
+                if "allowed" in meta:
+                    existing_allowed = set(existing.get("allowed", []))
+                    incoming_allowed = set(meta.get("allowed", []))
+                    existing["allowed"] = existing_allowed | incoming_allowed
+
+        # dm_holders: username -> list(holders) -> convert back to sets and merge
+        incoming_dm_holders: Dict[str, List[str]] = payload.get("dm_holders", {}) or {}
+        for user, holders_list in incoming_dm_holders.items():
+            holders_set = set(holders_list)
+            if user not in self.dm_holders:
+                self.dm_holders[user] = holders_set
+            else:
+                self.dm_holders[user].update(holders_set)
+
+        # pending_friend_requests: target_user -> list(requester_usernames)
+        incoming_pfr: Dict[str, List[str]] = payload.get("pending_friend_requests", {}) or {}
+        for target, req_list in incoming_pfr.items():
+            req_set = set(req_list)
+            if target not in self.pending_friend_requests:
+                self.pending_friend_requests[target] = req_set
+            else:
+                self.pending_friend_requests[target].update(req_set)
+
+        # pending_friend_responses: requester_user -> list[...]
+        incoming_pfrsp: Dict[str, List[Dict[str, Any]]] = payload.get(
+            "pending_friend_responses", {}
+        ) or {}
+        for requester, resps in incoming_pfrsp.items():
+            lst = self.pending_friend_responses.setdefault(requester, [])
+            lst.extend(resps)
+
+        # dm_super_store: username -> list[DM events]
+        incoming_dm_super: Dict[str, List[Dict[str, Any]]] = payload.get(
+            "dm_super_store", {}
+        ) or {}
+        for user, events in incoming_dm_super.items():
+            lst = self.dm_super_store.setdefault(user, [])
+            lst.extend(events)
+
+        # friend_super_store: username -> list[friend events]
+        incoming_friend_super: Dict[str, List[Dict[str, Any]]] = payload.get(
+            "friend_super_store", {}
+        ) or {}
+        for user, events in incoming_friend_super.items():
+            lst = self.friend_super_store.setdefault(user, [])
+            lst.extend(events)
+
+        # user_status: username -> "ONLINE"/"OFFLINE"
+        incoming_status: Dict[str, str] = payload.get("user_status", {}) or {}
+        self.user_status.update(incoming_status)
+
+        print("[supernode] Replica state merged.")
+
+    def _handle_file_register(self, user, addr, payload):
+        file_id = payload["file_id"]
+        name = payload["name"]
+        size = payload["size"]
+        sha256 = payload["sha256"]
+        allowed = set(payload.get("allowed_users", []))
+
+        if file_id not in self.files:
+            self.files[file_id] = {
+                "name": name,
+                "size": size,
+                "sha256": sha256,
+                "owner": user,
+                "allowed": allowed,
+                "seeders": set([user]),
+            }
+        else:
+            self.files[file_id]["allowed"].update(allowed)
+            self.files[file_id]["seeders"].add(user)
+
+        resp = make_envelope(
+            MessageType.FILE_REGISTERED,
+            "supernode",
+            self.host, self.port,
+            self.lamport.tick(),
+            {"file_id": file_id}
+        )
+        self._send(resp, addr)
+
+    def _handle_file_list(self, user, addr, payload):
+        visible = []
+        for fid, meta in self.files.items():
+            if user in meta["allowed"]:
+                visible.append({
+                    "file_id": fid,
+                    "name": meta["name"],
+                    "size": meta["size"],
+                    "owner": meta["owner"],
+                    "seeders": list(meta["seeders"])
+                })
+
+        resp = make_envelope(
+            MessageType.FILE_LIST_RESPONSE,
+            "supernode",
+            self.host, self.port,
+            self.lamport.tick(),
+            {"files": visible}
+        )
+        self._send(resp, addr)
+
+    def _handle_file_info(self, user, addr, payload):
+        file_id = payload["file_id"]
+        meta = self.files.get(file_id)
+        if not meta:
+            resp = {"error": "not_found"}
+        elif user not in meta["allowed"]:
+            resp = {"error": "forbidden"}
+        else:
+            # Build a JSON-serialisable view
+            resp = {
+                "file_id": file_id,
+                "name": meta["name"],
+                "size": meta["size"],
+                "sha256": meta["sha256"],
+                "owner": meta["owner"],
+                "allowed": list(meta["allowed"]),
+                "seeders": list(meta["seeders"]),
+            }
+
+        env = make_envelope(
+            MessageType.FILE_INFO_RESPONSE,
+            "supernode",
+            self.host, self.port,
+            self.lamport.tick(),
+            resp,
+        )
+        self._send(env, addr)
+
+    def _handle_file_seed_update(self, user, addr, payload):
+        file_id = payload["file_id"]
+        action = payload["action"]
+
+        if file_id not in self.files:
+            return
+
+        if action == "add":
+            self.files[file_id]["seeders"].add(user)
+        else:
+            self.files[file_id]["seeders"].discard(user)
+
+    def _broadcast_supernode_list(self) -> None:
+        """
+        Send SUPERNODE_LIST_UPDATE to all known online users with the full
+        list of supernodes (including self).
+        """
+        # Compose list
+        entries = [{"host": self.host, "port": self.port}]
+        for host, port in sorted(self.peer_supernodes):
+            entries.append({"host": host, "port": port})
+
+        payload = {"supernodes": entries}
+        lamport = self.lamport.tick()
+
+        env = make_envelope(
+            MessageType.SUPERNODE_LIST_UPDATE,
+            "supernode",
+            self.host,
+            self.port,
+            lamport,
+            payload,
+        )
+
+        for user, (ip, port) in self.users.items():
+            self._send(env, (ip, port))
+        print(f"[supernode] Broadcast SUPERNODE_LIST_UPDATE to {len(self.users)} users.")
+
+    def register_with_seed_supernode(self, seed_host: str, seed_port: int) -> None:
+        """
+        Inform an existing "seed" supernode about this instance so it can add us
+        to its peer_supernodes set and broadcast SUPERNODE_LIST_UPDATE to clients.
+        """
+        payload = {"host": self.host, "port": self.port}
+        env = make_envelope(
+            MessageType.SUPERNODE_HELLO,
+            "supernode",
+            self.host,
+            self.port,
+            self.lamport.tick(),
+            payload,
+        )
+        try:
+            self._send(env, (seed_host, int(seed_port)))
+            print(
+                f"[supernode] Sent SUPERNODE_HELLO to seed {seed_host}:{seed_port} "
+                f"for self {self.host}:{self.port}"
+            )
+        except OSError as e:
+            print(
+                f"[supernode] Failed to send SUPERNODE_HELLO to "
+                f"{seed_host}:{seed_port}: {e!r}"
+            )
+
+    def request_full_replica_sync(self, peer):
+        env = make_envelope(
+            MessageType.SUPERNODE_REPLICA_REQUEST,
+            "supernode",
+            self.host, self.port,
+            self.lamport.tick(),
+            {"request": "full_state"}
+        )
+        self._send(env, peer)
+
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
@@ -1021,10 +1367,43 @@ def main() -> None:
     print(f"[supernode] CWD is: {os.getcwd()}")
     config = Config("config/supernode_config.json")
 
-    sn = Supernode(config["bind_host"], int(config["bind_port"]))
+    host = config["bind_host"]
+    base_port = int(config["bind_port"])
+    # How many consecutive ports to try starting from base_port
+    max_nodes = int(config.get("max_supernodes", 5))
+
+    sn = None
+    chosen_port = None
+    last_err = None
+
+    for offset in range(max_nodes):
+        port = base_port + offset
+        try:
+            sn = Supernode(host, port)
+            chosen_port = port
+            print(f"[supernode] Bound supernode on {host}:{port}")
+            break
+        except OSError as e:
+            last_err = e
+            print(f"[supernode] Port {port} unavailable ({e}); trying next...")
+
+    if sn is None:
+        raise RuntimeError(
+            f"Failed to bind any supernode port in range "
+            f"{base_port}-{base_port + max_nodes - 1}"
+        ) from last_err
+
     try:
         sn.start()
-        # Block forever until killed (Ctrl+C in a real console)
+
+        # If we are *not* the seed (first) supernode, register with seed
+        if chosen_port != base_port:
+            # Seed host is where clients already point; for local dev just use 127.0.0.1
+            seed_host = "127.0.0.1" if host == "0.0.0.0" else host
+            sn.register_with_seed_supernode(seed_host, base_port)
+            sn.request_full_replica_sync((seed_host, base_port))
+
+        # Block forever until killed (Ctrl+C)
         threading.Event().wait()
     finally:
         # Make sure we always stop cleanly if this function exits

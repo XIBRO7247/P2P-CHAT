@@ -78,3 +78,19 @@ class RoomHistoryManager:
     def get_history(self, room_id: str) -> list[tuple[str, str]]:
         with self._lock:
             return list(self._history.get(room_id, []))
+
+
+    def get_all(self) -> dict[str, list[tuple[str, str]]]:
+        """Return a shallow copy of all room histories."""
+        with self._lock:
+            return {
+                room: list(history)
+                for room, history in self._history.items()
+            }
+
+    def clear_room(self, room_id: str) -> None:
+        """Drop local history for a single room and persist."""
+        with self._lock:
+            if room_id in self._history:
+                del self._history[room_id]
+                self._save()

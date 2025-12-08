@@ -53,3 +53,26 @@ class Storage:
         # Sort for stable ordering (e.g. if chunk_ids are monotonic)
         chunk_ids.sort()
         return chunk_ids
+
+    def delete_room(self, room_id: str) -> None:
+        """
+        Delete all stored chunks for a single room.
+        Safe to call even if the room has no local chunks.
+        """
+        room_dir = self.base_path / room_id
+        if not room_dir.exists() or not room_dir.is_dir():
+            return
+
+        for p in room_dir.glob("*.json"):
+            try:
+                p.unlink()
+            except Exception:
+                # Best-effort only; ignore failures
+                pass
+
+        try:
+            room_dir.rmdir()
+        except OSError:
+            # Directory not empty or in use; ignore.
+            pass
+

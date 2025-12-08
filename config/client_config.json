@@ -1,6 +1,9 @@
 {
   "supernode_host": "127.0.0.1",
   "supernode_port": 50000,
+  "supernodes": [
+    { "host": "127.0.0.1", "port": 50000 }
+  ],
   "listen_port_start": 50010,
   "listen_port_end": 50050,
 

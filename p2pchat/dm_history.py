@@ -61,3 +61,11 @@ class DMHistoryManager:
     def get_history(self, peer: str) -> list[tuple[str, str]]:
         """Return the full DM history with a given peer."""
         return list(self._history.get(peer, []))
+
+    def get_all(self) -> dict[str, list[tuple[str, str]]]:
+        """Return a shallow copy of all DM histories."""
+        return {
+            peer: list(msgs)
+            for peer, msgs in self._history.items()
+        }
+
